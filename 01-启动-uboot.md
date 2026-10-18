@@ -1,0 +1,7 @@
+RK3588为例：
+首先uboot就是用来启动linux内核前做准备工作的代码工具
+
+首先电源上电，芯片内部有一个代码叫BootROM，这个时候DDR还没有初始化，是没法使用的，只能使用片内内存，但是很小是不能用来启动整个系统的，所以这个时候需要先初始化DDR，再用DDR来运行uboot后面的代码，这个时候BootROM就去搬运loader，这是一个由uboot编译得到的东西，功能就是用于启动完整的uboot，其中的一个模块就是TPL，TPL会初始化DDR，TPL干完返回 BootROM，BootROM把SPL搬进DDR，然后运行SPL解析uboot文件得到ATF(BL31) + OP-TEE(BL32) + U-Boot 本体 + U-Boot 设备树，ATF建立一个安全框架然后就会拉起uboot，所以BootROM+uboot里面的loader初始化DDR并运行就很像Windows电脑的BIOS，再后面就可以启动内核了，然后uboot就会加载 + 传参 + 跳转linux内核启动。
+（其中，BootROM是存储在片内ROM的，所以我们的使用是不会破坏到这个东西的，所以这些板子都能反复烧录不会彻底成砖）
+
+然后在这个里面使用RKDevTool烧录linux系统，看到MASKROM就说明现在是BootROM在接管usb接口进行烧录；如果是LOADER说明是DDR初始化完成后的loader在接管usb口，这个模式也可以在uboot的命令行里面使用命令到达，比如内核坏了，在这个时候就卡在ADB和LOADER之间但是两个都不是不能正常响应不会自己返回，就需要使用uboot的命令行来返回loader接管usb口，进入LOADER模式；如果是ADB说明是启动完整的linux在接管USB，这个时候是不能烧录的
