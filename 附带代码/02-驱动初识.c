@@ -1,0 +1,158 @@
+#include <linux/types.h>//引用需要的头文件
+#include <linux/kernel.h>
+#include <linux/delay.h>
+#include <linux/ide.h>
+#include <linux/init.h>
+#include <linux/module.h>
+
+//这个代码是使用的模拟驱动，就是使用一个单纯的回复作为模拟硬件的变换，主要是演示整个流程
+#define CHRDEVBASE_MAJOR 200//这个驱动的编号，后面把这个编号写到注册函数中就可以再内核需要调用的时候发现
+//然后我们模拟的是一个硬件设备，这个设备的编号就是200
+//我们写200是chrdevbase，内核加载到这个驱动自己记录在自己的函数表里面记录200是chrdevbase
+//设备文件我们写mknod /dev/chrdevbase c 200 0，表明这个设备是200
+//然后我们使用的时候比如open("/dev/chrdevbase")想打开这个设备，内核读发现这个设备是200，就查自己的表发现是chrdevbase
+//然后就可以导向这个驱动
+#define CHRDEVBASE_NAME "chrdevbase"//这个就是模拟的设备的名字
+static char readbuf[100];//模拟的硬件读寄存器，如果是真设别这个地方就是设别读寄存器的地址
+//触发读的时候就是发送这个寄存器的内容也就是模拟的这个变量
+static char writebuf[100];//模拟的硬件写寄存器，同上
+static char kerneldata[] = {"kernel data!"};//模拟的设备数据，也就是像硬件里存着的那个值
+//要读的时候驱动就把这个值加载到readbuf这个模拟的寄存器，然后读就发送读寄存器的neirong
+
+
+/*
+* @description : 打开设备   //这函数干什么
+* @param - inode : 传递给驱动的inode  //参数1：哪个设备节点（/dev/chrdevbase 本身）
+* @param - filp : 设备文件，file 结构体有个叫做 private_data 的  //参数2：这一次打开（每次 open 新建一个）
+* 成员变量，一般在 open 的时候将 private_data 指向设备结构体。
+* @return : 0 成功; 其他 失败 。//返回值说明：0 成功
+*/
+static int chrdevbase_open(struct inode *inode, struct file *filp)
+{
+//printk("chrdevbase open!\r\n");
+    return 0;
+}
+
+//注释规格如上
+/*
+* @description : 从设备读取数据
+* @param - filp : 要打开的设备文件(文件描述符)   //这里需要注意，这个文件不是/dev/chrdevbase的地址，/dev是设备挂载的地址
+//他就是个门，这里的file是打开的是谁的表明，因为内核中有时会出现多线程的问题，如果多个进程一起使用这个代码
+ //就需要用file这个东西来表明哪个打开的是哪个
+* @param - buf : 返回给用户空间的数据缓冲区
+* @param - cnt : 要读取的数据长度
+* @param - offt : 相对于文件首地址的偏移
+* @return : 读取的字节数，如果为负值，表示读取失败
+*/
+static ssize_t chrdevbase_read(struct file *filp, char __user *buf, size_t cnt, loff_t *offt)
+{
+int retvalue = 0;
+/* 向用户空间发送数据 */
+memcpy(readbuf, kerneldata, sizeof(kerneldata));    //读取设备里存的数据的函数，从内部把数据kerneldata读到读缓冲readbuf
+retvalue = copy_to_user(buf, readbuf, cnt);    //把读寄存器readbuf的数据复制到用户的数据缓冲buf，长度cnt
+if (retvalue == 0) {    //retvalue就是返还值
+printk("kernel senddata ok!\r\n");
+} else {
+printk("kernel senddata failed!\r\n");
+}
+//printk("chrdevbase read!\r\n");
+return 0;   //这里是教材的注释和写的有问题的，不用在意，功能照旧
+}
+//这里面有核心思路就是就是为什么需要数据缓冲和用户地址，首先为什么不能直接*用户地址=数据
+//因为内核态和用户态是分离的，用户态可以用户随便改，改催了也就是报错，但是内核态不行，内核态出错的代价是系统奔溃所以内核需要保证正确才行
+//所以这里，用户给的地址没有open验证（copy_to_user 本身内部会做 access_ok 检查并触发缺页处理）之前是不知道是否有问题的
+//所以如果地址有问题，直接复制会直接出错
+//然后内核态因为和用户态直接分开，所以地址是不通用的，同样的地址可能指向不同的地方
+
+
+/*
+* @description : 向设备写数据
+* @param - filp : 设备文件，表示打开的文件描述符
+* @param - buf : 要写给设备写入的数据
+* @param - cnt : 要写入的数据长度
+* @param - offt : 相对于文件首地址的偏移
+* @return : 写入的字节数，如果为负值，表示写入失败
+*/
+static ssize_t chrdevbase_write(struct file *filp, const char __user *buf, size_t cnt, loff_t *offt)
+{
+int retvalue = 0;
+/* 接收用户空间传递给内核的数据并且打印出来 */
+retvalue = copy_from_user(writebuf, buf, cnt);  //同读，就是从用户缓冲区写到驱动的写缓冲
+if (retvalue == 0) {
+printk("kernel recevdata:%s\r\n", writebuf);
+} else {
+printk("kernel recevdata failed!\r\n");
+}
+//printk("chrdevbase write!\r\n");
+return 0;
+}
+
+
+/*
+* @description : 关闭/释放设备
+* @param - filp : 要关闭的设备文件(文件描述符)
+* @return : 0 成功; 其他 失败
+*/
+static int chrdevbase_release(struct inode *inode, struct file *filp)   //和打开设备一样，用完还需要关闭设备结束这个进程
+{
+//printk("chrdevbase release!\r\n");
+    return 0;
+}
+
+
+/*
+* 设备操作函数结构体
+*/
+static struct file_operations chrdevbase_fops = {   //这张表是给内核看的，不是给用户看的
+        //内核需要调用哪个用户用的功能的时候就通过这个表查找对应的函数，现在这个是最简单的，还没有哪些检测是否在线等函数，所以只能模拟
+        .owner = THIS_MODULE,   //让内核知道这是个模块，并做「使用中保护」，内核自己会检查，读到.owner得知是一个驱动才会给驱动保护
+        //才会有使用中不能删除的保护
+        .open = chrdevbase_open,
+        .read = chrdevbase_read,
+        .write = chrdevbase_write,
+        .release = chrdevbase_release,
+};
+
+
+/*
+* @description : 驱动入口函数
+* @return : 0 成功; 其他 失败
+*/
+static int __init chrdevbase_init(void)
+{
+    int retvalue = 0;
+/* 注册字符设备驱动 */
+    retvalue = register_chrdev(CHRDEVBASE_MAJOR, CHRDEVBASE_NAME, &chrdevbase_fops);
+    //使用编号，名字，功能表向内核注册这个驱动
+    if (retvalue < 0) {
+        printk("chrdevbase driver register failed\r\n");
+    }
+    printk("chrdevbase_init()\r\n");
+    return 0;
+}
+
+
+/*
+* @description : 驱动出口函数
+* @return : 无
+*/
+static void __exit chrdevbase_exit(void)
+{
+/* 注销字符设备驱动 */
+    unregister_chrdev(CHRDEVBASE_MAJOR, CHRDEVBASE_NAME);
+    //卸载这个编号和名字的驱动
+    printk("chrdevbase_exit()\r\n");
+}
+
+
+/*
+* 将上面两个函数指定为驱动的入口和出口函数
+*/
+module_init(chrdevbase_init);
+module_exit(chrdevbase_exit);
+
+/*
+* LICENSE 和作者信息
+*/
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("zuozhongkai");
