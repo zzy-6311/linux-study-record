@@ -1,0 +1,472 @@
+（原本的一些环境配置都在文档B里面做过了，是先做的B在做的A，所以一些环境就不配置了）
+目的：保留现有 U-Boot、Linux 6.12 内核和设备树，自己制作 Debian 13（trixie）ARM64 根文件系统
+首先，我们直接用正点官方的debain包来解包制作就没很大的学习的意思了，所以我们来使用debootstrap和qemu-aarch64-static自己从头制作一个roofs包
+（debootstrap 用于下载并生成 Debian 最小根文件系统，qemu-aarch64-static 用于在 x86_64 电脑上执行 ARM64 程序，后面配置 Debian 时需要它）
+还是先打开wsl，挂载我的虚拟盘使用指令：
+wsl --mount "H:\wsl\rk3588-ext4.vhdx" --vhd --bare（这一步需要管理员权限）
+wsl
+配置一下环境：
+（检查文件环境）
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
+findmnt -T /mnt/rk3588
+df -h /mnt/rk3588
+（检查工具版本）//这两个包在SDK编译的时候就安装了，也是SDK需要用来配置roofs
+command -v debootstrap
+debootstrap --version
+qemu-aarch64-static --version
+（创建工作目录）
+mkdir -p /mnt/rk3588/debian-rk3588
+cd /mnt/rk3588/debian-rk3588
+
+下面开始第一步的制作：
+sudo debootstrap \
+  --arch=arm64 \
+  --foreign \
+  trixie \
+  rootfs \
+  https://deb.debian.org/debian
+
+/*
+--arch=arm64：目标系统是 RK3588 使用的 ARM64，不是电脑的 x86_64；
+--foreign：只进行第一阶段，在 x86_64 主机上下载并解包 ARM64 软件；
+trixie：Debian 13；
+rootfs：生成到当前目录下的 rootfs/；
+最后的地址：Debian 官方软件源。
+*/
+
+把 QEMU 放入 rootfs：（这样 chroot 进入 ARM64 根文件系统后，仍然能找到模拟器）
+cd /mnt/rk3588/debian-rk3588
+sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+
+然后配置刚才解包的 Debian 软件包：
+sudo chroot rootfs \
+  /usr/bin/qemu-aarch64-static -L / \
+  /bin/sh /debootstrap/debootstrap --second-stage
+
+解包结束显示：
+I: Configuring ifupdown...
+I: Configuring libc-bin...
+I: Configuring ca-certificates...
+I: Base system installed successfully.
+
+然后准备 chroot 运行环境：
+cd /mnt/rk3588/debian-rk3588
+sudo cp /etc/resolv.conf rootfs/etc/resolv.conf
+sudo mount -t proc proc rootfs/proc
+sudo mount -t sysfs sysfs rootfs/sys
+sudo mount --rbind /dev rootfs/dev
+sudo mount --make-rprivate rootfs/dev
+（这些代码的作用就是给 Debian rootfs 接入网络解析、进程信息、系统信息和设备接口）
+
+进入 Debian ARM64 系统：
+sudo chroot rootfs \
+  /usr/bin/qemu-aarch64-static -L / \
+  /bin/bash
+（整体作用：从 WSL 的 Ubuntu 环境，进入我们新建的 Debian ARM64 环境）
+
+整理一下搜索路径：export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin（保证 Debian 能正确找到自己的命令）
+然后就是配置软件仓库，让debain知道在哪里找要的文件：
+cat > /etc/apt/sources.list <<'EOF'
+deb https://deb.debian.org/debian trixie main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
+deb https://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+EOF
+然后更新一下索引包：apt update，这样准备工作就完成了
+
+
+/*
+这里做一大波的解释，首先这里的这个进入debain的用户空间就是模拟的板子的用户空间，前面的操作就是用一些软件把debain的官方骨架支撑起来，在电脑上完成一个模拟，模拟出了板子上的系统，然后我们在模拟的系统里面安装我们想要的软件包，软件，配置，最后打包起来就可以做成一个roofs也就是根目录系统，这也就是我们所说的定制自己需要的根目录系统，然后安装到板子上也就会有我们在这里模拟的时候安装的这些东西了。
+然后在这整个过程中，各个部分的职责：
+debootstrap的准备：
+第一阶段把这些文件解包到 rootfs，第二阶段再执行软件包配置脚本。完成后，rootfs 中就具备了：
+/bin/bash                  Shell 程序
+/usr/bin/apt               软件包管理工具
+/lib/ld-linux-aarch64.so.1 ARM64 动态加载器
+/lib/aarch64-linux-gnu/    ARM64 运行库
+/etc/                      系统配置
+/var/lib/dpkg/             软件包数据库
+
+然后到下一个，chroot的准备：
+执行sudo chroot rootfs，WSL的Linux内核会把这个进程的根目录切换到rootfs
+这个时候路劲就会变化：
+chroot 前：
+/mnt/rk3588/debian-rk3588/rootfs/etc/os-release
+chroot 后：
+/etc/os-release
+
+再然后下一个，QEMU的准备：
+chroot 后，里面的 bash 是 ARM64 程序，而你的电脑是 x86_64，不能直接执行，所以运行：/usr/bin/qemu-aarch64-static -L / /bin/bash
+实际过程是：
+WSL 先运行 x86_64 的 qemu-aarch64-static；
+QEMU 读取 ARM64 的 /bin/bash；
+根据 rootfs 中的动态加载器和 libc 启动 Bash；
+把 ARM64 指令翻译成电脑能够执行的指令；
+Bash 需要读写文件、联网时，QEMU 把相应的系统调用转交给 WSL 的 Linux 内核。
+（所以看到的 Bash 在运行，是 QEMU 用户模式模拟的结果，并不是电脑原生执行了 ARM64 程序，所以QEMU就是个翻译器）
+
+所以这里没有启动 Debian 内核，也没有启动完整的 systemd 和图形桌面，只是进入了一个使用 Debian 用户空间的 ARM64 Bash
+后面真的把这个打包的系统放到RK3588的板子上的时候，就会根据整正的路劲，直接进入我们配置好的这些东西
+*/
+
+
+现在来安装基础系统软件，首先要防止安装软件时在 chroot 中启动服务，当前环境没有真正运行 systemd，因此先告诉安装脚本“不要现在启动 SSH 等服务”，但不影响它们在真正启动时运行
+cat > /usr/sbin/policy-rc.d <<'EOF'
+#!/bin/sh
+exit 101
+EOF
+chmod +x /usr/sbin/policy-rc.d
+（这个文件只用于构建阶段，最终制作镜像前会删除）
+
+然后再批量安装基础软件：
+apt install -y \
+  systemd-sysv udev dbus kmod procps \
+  sudo openssh-server \
+  network-manager wpasupplicant rfkill \
+  iproute2 iputils-ping ethtool \
+  ca-certificates curl wget \
+  nano locales console-setup \
+  usbutils pciutils
+/*
+systemd-sysv：开发板启动后的系统初始化和服务管理；
+sudo：普通用户提权；
+openssh-server：SSH 远程登录；
+network-manager、wpasupplicant：有线和 WiFi 网络管理；
+ip、ping、ethtool：网络配置与检查；
+kmod：lsmod、modprobe 等内核模块工具；
+nano、locales：编辑器和语言环境；
+usbutils、pciutils：lsusb、lspci 等硬件检查工具。
+*/
+
+运行的时候出现了一个蓝色的keyboard-configuration 键盘布局配置界面，需要我们配置我们使用的键盘，我们一般的键盘就是English（US）美式键盘，直接选择
+然后有弹出来了console-setup 在配置 Linux 文本控制台字体支持的字符集，默认选中的是Guess optimal character set，也就是自动选择合适的字符集，直接选择这个
+跑完了显示：
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+
+现在来创建登录用户并设置主机名，有了这一步设置，再后面烧录上板后才能，正常登录使用ssh和串口，也才有设备名字，设置：
+echo rk3588-debian > /etc/hostname
+
+cat > /etc/hosts <<'EOF'
+127.0.0.1 localhost
+127.0.1.1 rk3588-debian
+::1 localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+（命令行提示符和局域网中会使用 rk3588-debian 这个名字）
+
+然后我们创建一个普通用户zzy：useradd -m -s /bin/bash zzy，设置密码：passwd zzy，然后就是输入密码
+然后把sudo权限给予zzy用户：usermod -aG sudo,adm,dialout,audio,video,plugdev zzy
+然后可以验证：
+id zzy
+cat /etc/hostname
+ls -ld /home/zzy
+
+输出：
+root@LAPTOP-4S39SRHC:/# id zzy
+cat /etc/hostname
+ls -ld /home/zzy
+uid=1000(zzy) gid=1000(zzy) groups=1000(zzy),4(adm),20(dialout),27(sudo),29(audio),44(video),46(plugdev)
+rk3588-debian
+drwx------ 2 zzy zzy 4096 Oct 27 12:56 /home/zzy
+
+然后我们配置配置语言环境和启动服务：
+sed -i \
+  -e 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' \
+  -e 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' \
+  /etc/locale.gen
+
+locale-gen
+先默认使用英文，避免启动日志或串口程序出现乱码，中文环境已经生成，后续可以切换，切换英文：update-locale LANG=en_US.UTF-8
+然后设置首次进入的命令行：systemctl set-default multi-user.target，我们先验收“串口登录 + 网络”，暂时不让它尝试启动图形桌面：
+systemctl enable \
+  serial-getty@ttyFIQ0.service \
+  NetworkManager.service \
+  ssh.service
+（这里的 enable 只是设置开发板开机时自动启用，不会在 chroot 中立即启动服务）
+
+验证配置得到：
+root@LAPTOP-4S39SRHC:/# cat /etc/default/locale
+systemctl is-enabled \
+  serial-getty@ttyFIQ0.service \
+  NetworkManager.service \
+  ssh.service
+systemctl get-default
+回复：
+#  File generated by update-locale
+LANG=en_US.UTF-8
+enabled
+enabled
+enabled
+multi-user.target
+
+然后第九步比较特殊们就是要给现在这个roofs搭配我们要用的内核，但是这个我们下载的包肯定是不知道我们这个板子的各种参数的，所以我们需要读取一下B文档里面做的官方SDK包的配置
+所以我们先输入exit退出当前的chroot，然后只读的挂载参考rootfs，也就是我们SDK编译的那个roofs，看看内核的配置是什么：
+mkdir -p /mnt/rk3588/ubuntu-reference
+sudo mount -o loop,ro \
+  "/mnt/d/linux/sdk编译包/分体包/rootfs.img" \
+  /mnt/rk3588/ubuntu-reference
+挂载后读取：
+ls -la /mnt/rk3588/ubuntu-reference/lib/modules
+ls /mnt/rk3588/ubuntu-reference/lib/firmware | head
+得到：
+zzy@LAPTOP-4S39SRHC:/mnt/rk3588/debian-rk3588$ ls -la /mnt/rk3588/ubuntu-reference/lib/modules
+ls /mnt/rk3588/ubuntu-reference/lib/firmware | head
+total 12
+drwxr-xr-x  3 root root 4096 Oct 25 12:17 .
+drwxr-xr-x 67 root root 4096 Oct 25 12:17 ..
+drwxr-xr-x  3 root root 4096 Oct 25 12:17 6.12.69
+regulatory.db
+regulatory.db.p7s
+rtl8723befw.bin
+rtl8723befw_36.bin
+rtl8733bu_config
+rtl8733bu_fw
+rtl8852bu_config
+rtl8852bu_fw
+rtlbt
+
+现在就要复制内核模块和硬件固件，复制到 Debian rootfs：
+cd /mnt/rk3588/debian-rk3588
+
+sudo mkdir -p rootfs/lib/modules rootfs/lib/firmware
+
+sudo cp -a \
+  /mnt/rk3588/ubuntu-reference/lib/modules/6.12.69 \
+  rootfs/lib/modules/
+再复制固件：
+sudo cp -a --remove-destination \
+  /mnt/rk3588/ubuntu-reference/lib/firmware/regulatory.db \
+  /mnt/rk3588/ubuntu-reference/lib/firmware/regulatory.db.p7s \
+  rootfs/lib/firmware/
+然后执行依赖生成：
+sudo chroot rootfs \
+  /usr/bin/qemu-aarch64-static -L / \
+  /sbin/depmod -a 6.12.69
+
+验证：
+zzy@LAPTOP-4S39SRHC:/mnt/rk3588/debian-rk3588$ ls -l rootfs/lib/firmware/regulatory.db*
+ls -lh rootfs/lib/modules/6.12.69/modules.dep
+sudo du -sh rootfs/lib/modules/6.12.69 rootfs/lib/firmware
+输出：
+-rw-r--r-- 1 root root 6380 Aug 18 01:26 rootfs/lib/firmware/regulatory.db
+-rw-r--r-- 1 root root 6380 Jun  6 01:02 rootfs/lib/firmware/regulatory.db-debian
+-rw-r--r-- 1 root root 6380 Jun  6 01:02 rootfs/lib/firmware/regulatory.db-upstream
+-rw-r--r-- 1 root root 1085 Aug 18 01:26 rootfs/lib/firmware/regulatory.db.p7s
+-rw-r--r-- 1 root root 1118 Jun  6 01:02 rootfs/lib/firmware/regulatory.db.p7s-debian
+-rw-r--r-- 1 root root 1085 Jun  6 01:02 rootfs/lib/firmware/regulatory.db.p7s-upstream
+-rw-r--r-- 1 root root 7.6K Oct 27 21:28 rootfs/lib/modules/6.12.69/modules.dep
+19M     rootfs/lib/modules/6.12.69
+380K    rootfs/lib/firmware
+
+配置文件系统挂载表：
+cd /mnt/rk3588/debian-rk3588
+
+sudo tee rootfs/etc/fstab > /dev/null <<'EOF'
+/dev/root       /               ext4        defaults                0 1
+proc            /proc           proc        defaults                0 0
+devtmpfs        /dev            devtmpfs    defaults                0 0
+devpts          /dev/pts        devpts      mode=0620,ptmxmode=0000,gid=5 0 0
+tmpfs           /dev/shm        tmpfs       nosuid,nodev,noexec     0 0
+sysfs           /sys            sysfs       nosuid,nodev,noexec     0 0
+configfs        /sys/kernel/config configfs defaults                0 0
+debugfs         /sys/kernel/debug debugfs   defaults                0 0
+PARTLABEL=oem   /oem            ext4        defaults                0 2
+PARTLABEL=userdata /userdata    ext4        defaults                0 2
+EOF
+
+sudo mkdir -p rootfs/oem rootfs/userdata
+
+现在就参考完了原来的包，删掉创建的参考文件夹：sudo umount /mnt/rk3588/ubuntu-reference
+可以验证得到：
+zzy@LAPTOP-4S39SRHC:/mnt/rk3588/debian-rk3588$ cat rootfs/etc/fstab
+sudo du -sh rootfs
+回复：
+/dev/root       /               ext4        defaults                0 1
+proc            /proc           proc        defaults                0 0
+devtmpfs        /dev            devtmpfs    defaults                0 0
+devpts          /dev/pts        devpts      mode=0620,ptmxmode=0000,gid=5 0 0
+tmpfs           /dev/shm        tmpfs       nosuid,nodev,noexec     0 0
+sysfs           /sys            sysfs       nosuid,nodev,noexec     0 0
+configfs        /sys/kernel/config configfs defaults                0 0
+debugfs         /sys/kernel/debug debugfs   defaults                0 0
+PARTLABEL=oem   /oem            ext4        defaults                0 2
+PARTLABEL=userdata /userdata    ext4        defaults                0 2
+du: cannot access 'rootfs/proc/23794/task/23794/fd/4': No such file or directory
+du: cannot access 'rootfs/proc/23794/task/23794/fdinfo/4': No such file or directory
+du: cannot access 'rootfs/proc/23794/fd/3': No such file or directory
+du: cannot access 'rootfs/proc/23794/fdinfo/3': No such file or directory
+675M    rootfs
+
+现在结果已经出来了，完成了，现在开始收尾，检查还挂载了哪些目录：
+findmnt -R "$(pwd)/rootfs"
+findmnt | grep -E 'rk3588|rootfs|ubuntu'
+输出：
+├─/init                                              rootfs[/init]           rootfs      ro,size=4059340k,nr_inodes=1014835
+└─/mnt/rk3588                                        /dev/sdd                ext4        rw,relatime
+  ├─/mnt/rk3588/debian-rk3588/rootfs/proc            proc                    proc        rw,relatime
+  ├─/mnt/rk3588/debian-rk3588/rootfs/sys             sysfs                   sysfs       rw,relatime
+  └─/mnt/rk3588/debian-rk3588/rootfs/dev             none                    devtmpfs    rw,nosuid,relatime,size=4059340k,nr_inodes=1014835,mode=755
+    ├─/mnt/rk3588/debian-rk3588/rootfs/dev/pts       devpts                  devpts      rw,nosuid,noexec,noatime,gid=5,mode=620,ptmxmode=000
+    ├─/mnt/rk3588/debian-rk3588/rootfs/dev/shm       none                    tmpfs       rw,nosuid,nodev,noatime
+    ├─/mnt/rk3588/debian-rk3588/rootfs/dev/hugepages hugetlbfs               hugetlbfs   rw,nosuid,nodev,relatime,pagesize=2M
+    └─/mnt/rk3588/debian-rk3588/rootfs/dev/mqueue    mqueue                  mqueue      rw,nosuid,nodev,noexec,relatime
+
+执行卸载：
+sudo umount -R "$(pwd)/rootfs/proc"
+sudo umount -R "$(pwd)/rootfs/sys"
+sudo umount -R "$(pwd)/rootfs/dev"
+
+findmnt -R "$(pwd)/rootfs" || true
+
+检查网络配置是否混入了 WSL 地址：
+ls -l rootfs/etc/resolv.conf
+cat rootfs/etc/resolv.conf
+cat rootfs/etc/machine-id 2>/dev/null || true
+输出：
+-rw-r--r-- 1 root root 200 Oct 27 20:24 rootfs/etc/resolv.conf
+# This file was automatically generated by WSL. To stop automatic generation of this file, add the following entry to /etc/wsl.conf:
+# [network]
+# generateResolvConf = false
+nameserver 10.255.255.254
+2f31dc28eb0947c281733484898ef72c
+
+这里有两处需要修正：
+resolv.conf 是 WSL 自动生成的，10.255.255.254 在板卡上无效
+machine-id 已在构建机生成。镜像中应将它清空，让板卡首次启动时生成自己的 ID，避免以后多个设备使用相同身份
+所以执行最终修正：
+# 清理 chroot 内下载的软件包缓存
+sudo chroot rootfs \
+  /usr/bin/qemu-aarch64-static -L / \
+  /usr/bin/apt-get clean
+
+# 删除只在构建阶段使用的 QEMU 和服务启动限制
+sudo rm -f rootfs/usr/bin/qemu-aarch64-static
+sudo rm -f rootfs/usr/sbin/policy-rc.d
+
+# 清除 WSL 的 DNS 配置；NetworkManager 启动后会重新生成
+sudo truncate -s 0 rootfs/etc/resolv.conf
+
+# 让板卡首次启动时生成新的 machine-id
+sudo truncate -s 0 rootfs/etc/machine-id
+
+# 清理镜像中不需要保留的临时文件
+sudo rm -rf rootfs/tmp/* rootfs/var/tmp/*
+
+随后验证：
+findmnt -R "$(pwd)/rootfs" || true
+
+test ! -e rootfs/usr/bin/qemu-aarch64-static && echo "QEMU 已移除"
+test ! -e rootfs/usr/sbin/policy-rc.d && echo "policy-rc.d 已移除"
+wc -c rootfs/etc/resolv.conf rootfs/etc/machine-id
+
+sudo du -sh --exclude=proc --exclude=sys --exclude=dev rootfs
+df -h /mnt/rk3588
+输出：
+QEMU 已移除
+policy-rc.d 已移除
+0 rootfs/etc/resolv.conf
+0 rootfs/etc/machine-id
+0 total
+531M    rootfs
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdd        147G   30G  110G  22% /mnt/rk3588
+
+现在状态符合制作镜像的条件：
+所有临时挂载已解除，构建辅助文件已删除，清理后实际系统约 531 MB，虚拟盘还有 110 GB 可用空间
+制作一个 1 GiB 的 ext4 镜像即可，约有 400～450 MB 空闲空间用于首次启动和日志
+创建镜像并直接写入 rootfs：
+truncate -s 1G rootfs.img
+sudo mkfs.ext4 -F \
+  -L rootfs \
+  -d rootfs \
+  rootfs.img
+检查镜像文件系统：
+ls -lh rootfs.img
+sudo fsck.ext4 -fn rootfs.img
+sudo dumpe2fs -h rootfs.img 2>/dev/null | grep -E \
+  'Filesystem volume name|Block count|Free blocks|Inode count|Free inodes|Block size'
+输出：
+-rw-r--r-- 1 zzy zzy 1.0G Oct 27 22:26 rootfs.img
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+rootfs: 19683/65536 files (0.1% non-contiguous), 138382/262144 blocks
+Filesystem volume name:   rootfs
+Inode count:              65536
+Block count:              262144
+Free blocks:              123762
+Free inodes:              45853
+Block size:               4096
+
+然后进行最后一次只读挂载验收：
+mkdir -p verify-rootfs
+sudo mount -o loop,ro rootfs.img verify-rootfs
+
+cat verify-rootfs/etc/os-release
+grep '^zzy:' verify-rootfs/etc/passwd
+grep '^zzy:' verify-rootfs/etc/group || true
+
+ls -l verify-rootfs/sbin/init
+ls -l verify-rootfs/etc/systemd/system/getty.target.wants/
+ls -l verify-rootfs/etc/systemd/system/multi-user.target.wants/
+
+test -f verify-rootfs/lib/modules/6.12.69/modules.dep \
+  && echo "6.12.69 模块依赖文件存在"
+
+wc -c verify-rootfs/etc/resolv.conf verify-rootfs/etc/machine-id
+
+输出：
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+NAME="Debian GNU/Linux"
+VERSION_ID="13"
+VERSION="13 (trixie)"
+VERSION_CODENAME=trixie
+DEBIAN_VERSION_FULL=13.7
+ID=debian
+HOME_URL="https://www.debian.org/"
+SUPPORT_URL="https://www.debian.org/support"
+BUG_REPORT_URL="https://bugs.debian.org/"
+zzy:x:1000:1000::/home/zzy:/bin/bash
+zzy:x:1000:
+lrwxrwxrwx 1 root root 22 Apr 14  2026 verify-rootfs/sbin/init -> ../lib/systemd/systemd
+total 0
+lrwxrwxrwx 1 root root 38 Oct 26 17:36 getty@tty1.service -> /usr/lib/systemd/system/getty@.service
+lrwxrwxrwx 1 root root 45 Oct 27 21:11 serial-getty@ttyFIQ0.service -> /usr/lib/systemd/system/serial-getty@.service
+total 0
+lrwxrwxrwx 1 root root 44 Oct 27 20:43 ModemManager.service -> /usr/lib/systemd/system/ModemManager.service
+lrwxrwxrwx 1 root root 46 Oct 27 20:43 NetworkManager.service -> /usr/lib/systemd/system/NetworkManager.service
+lrwxrwxrwx 1 root root 45 Oct 27 20:42 console-setup.service -> /usr/lib/systemd/system/console-setup.service
+lrwxrwxrwx 1 root root 36 Oct 26 18:00 cron.service -> /usr/lib/systemd/system/cron.service
+lrwxrwxrwx 1 root root 44 Oct 26 18:00 e2scrub_reap.service -> /usr/lib/systemd/system/e2scrub_reap.service
+lrwxrwxrwx 1 root root 42 Oct 26 18:01 networking.service -> /usr/lib/systemd/system/networking.service
+lrwxrwxrwx 1 root root 40 Oct 26 17:36 remote-fs.target -> /usr/lib/systemd/system/remote-fs.target
+lrwxrwxrwx 1 root root 35 Oct 27 20:43 ssh.service -> /usr/lib/systemd/system/ssh.service
+lrwxrwxrwx 1 root root 46 Oct 27 20:43 wpa_supplicant.service -> /usr/lib/systemd/system/wpa_supplicant.service
+6.12.69 模块依赖文件存在
+0 verify-rootfs/etc/resolv.conf
+0 verify-rootfs/etc/machine-id
+0 total
+
+检查完必须卸载：
+sudo umount verify-rootfs
+findmnt -R "$(pwd)/verify-rootfs" || true
+
+
+到现在为止也就是roofs已经生成完成了，现在需要我们来打包这个定制的roofs.img文件
+输入：cp -n rootfs.img "/mnt/d/linux/sdk编译包/分体包/debian-rootfs.img"，直接把文件复制出来
+还要检查一下复制的这个包是不是相同的，检查SHA-256，需要两者都相同：
+zzy@LAPTOP-4S39SRHC:/mnt/rk3588/debian-rk3588$ sha256sum rootfs.img
+sha256sum "/mnt/d/linux/sdk编译包/分体包/debian-rootfs.img"
+ls -lh "/mnt/d/linux/sdk编译包/分体包/debian-rootfs.img"
+输出：
+d8275f1d8cd97e5ccb5c088b64ea9a7443f5f4b3a4bda930aa008ebb7c014c98  rootfs.img
+d8275f1d8cd97e5ccb5c088b64ea9a7443f5f4b3a4bda930aa008ebb7c014c98  /mnt/d/linux/sdk编译包/分体包/debian-rootfs.img
+-rwxrwxrwx 1 zzy zzy 1.0G Oct 27 22:30 /mnt/d/linux/sdk编译包/分体包/debian-rootfs.img
+
+结果是一样的，这样就导出到了：D:\linux\sdk编译包\分体包\debian-rootfs.img这个路径
