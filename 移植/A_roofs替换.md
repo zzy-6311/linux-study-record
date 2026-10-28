@@ -26,6 +26,9 @@
 - [15. 打包成 ext4 镜像](#15-打包成-ext4-镜像)
 - [16. 镜像验收（只读挂载）](#16-镜像验收只读挂载)
 - [17. 导出与 SHA-256 校验](#17-导出与-sha-256-校验)
+- [18. 把自制 rootfs 打包成 update.img](#18-把自制-rootfs-打包成-updateimg)
+- [19. 导出 update.img 与校验](#19-导出-updateimg-与校验)
+- [20. 烧录上板与首次启动（WiFi / SSH）](#20-烧录上板与首次启动wifi--ssh)
 - [附录 A：完整命令速查](#附录-a完整命令速查)
 - [附录 B：如果要 WiFi，必须在第 11 步补这一步](#附录-b如果要-wifi必须在第-11-步补这一步)
 
@@ -49,6 +52,7 @@
 ③ 装软件 / 建用户 / 配服务
 ④ 拷贝内核模块 + 固件 + fstab
 ⑤ 清理 → 打成 ext4 镜像 → 验收 → 导出
+⑥ 与 SDK 的其它分区一起打包成 update.img → 烧录上板
 ```
 
 ---
@@ -825,6 +829,194 @@ d8275f1d8cd97e5ccb5c088b64ea9a7443f5f4b3a4bda930aa008ebb7c014c98  /mnt/d/linux/s
 
 ---
 
+## 18. 把自制 rootfs 打包成 update.img
+
+> 到这里我们手里只有**一个 rootfs** ✓
+> 但板子要烧的 `update.img` 需要把 **loader + 参数 + U-Boot + boot + recovery + oem + userdata + rootfs** 全都装进去 ✓
+> 所以做法是：**其它分区沿用 B 文档里已烧录成功的 SDK 固件** ✓，**只把 rootfs 换成我们自制的 Debian** ✓
+
+### ① 建立独立打包目录
+
+```bash
+PACK=/mnt/rk3588/debian-rk3588/pack-debian-update
+SRC="/mnt/d/linux/sdk编译包/分体包"
+TOOLS=/mnt/rk3588/atk_dlrk3588_linux6.12/tools/linux/Linux_Pack_Firmware/rockdev
+
+mkdir -p "$PACK/Image"
+
+# 复制打包工具和分区清单
+cp "$TOOLS/afptool" "$PACK/"
+cp "$TOOLS/rkImageMaker" "$PACK/"
+cp "$TOOLS/rk3588-package-file" "$PACK/package-file"
+```
+
+| 文件 | 作用 |
+|---|---|
+| **`afptool`** | 把 `package-file` 描述的所有分区**打成一个镜像** |
+| **`rkImageMaker`** | 给镜像**加上 RK3588 固件头**，生成可烧录的 `update.img` |
+| **`rk3588-package-file`** | 分区清单（每个分区对应哪个文件） |
+
+### ② 用软链接接入各分区镜像
+
+```bash
+# 前 8 个分区：沿用 SDK 编译好的固件
+ln -sfn "$SRC/MiniLoaderAll.bin" "$PACK/Image/MiniLoaderAll.bin"
+ln -sfn "$SRC/parameter.txt"     "$PACK/Image/parameter.txt"
+ln -sfn "$SRC/uboot.img"         "$PACK/Image/uboot.img"
+ln -sfn "$SRC/misc.img"          "$PACK/Image/misc.img"
+ln -sfn "$SRC/boot.img"          "$PACK/Image/boot.img"
+ln -sfn "$SRC/recovery.img"      "$PACK/Image/recovery.img"
+ln -sfn "$SRC/oem.img"           "$PACK/Image/oem.img"
+ln -sfn "$SRC/userdata.img"      "$PACK/Image/userdata.img"
+
+# 只有 rootfs 指向我们自己做的 Debian 镜像
+ln -sfn "/mnt/d/linux/sdk编译包/debian-rootfs.img" \
+        "$PACK/Image/rootfs.img"
+```
+
+**替换对照表**：
+
+| 分区 | 来源 |
+|---|---|
+| `MiniLoaderAll.bin` | B 文档 SDK 编译产物 ✓ 沿用 |
+| `parameter.txt` | B 文档 SDK 编译产物 ✓ 沿用 |
+| `uboot.img` | B 文档 SDK 编译产物 ✓ 沿用 |
+| `boot.img` | B 文档 SDK 编译产物 ✓ 沿用 |
+| `misc.img` / `recovery.img` / `oem.img` / `userdata.img` | B 文档 SDK 编译产物 ✓ 沿用 |
+| **`rootfs.img`** | **我们自制的 Debian 13** ⭐ 唯一替换项 |
+
+> 💡 **为什么用软链接而不是复制？**
+> - **省空间** ✓（不复制 1 GB 的 rootfs ✓）
+> - **不改原文件** ✓（后续想换 rootfs 只要改链接 ✓）
+
+### ③ 打包
+
+```bash
+cd "$PACK"
+
+# 第一步：把各分区打成一个 update.img
+./afptool -pack ./ Image/update.img
+
+# 第二步：加上 RK3588 固件头，生成最终的可烧录镜像
+./rkImageMaker -RK3588 \
+  Image/MiniLoaderAll.bin \
+  Image/update.img \
+  update.img \
+  -os_type:androidos
+```
+
+成功输出：
+
+```text
+Make firmware OK!
+------ OK ------
+********rkImageMaker ver 2.29********
+Generating new image, please wait...
+Writing head info...
+Writing boot file...
+Writing firmware...
+Generating MD5 data...
+MD5 data generated successfully!
+New image generated successfully!
+```
+
+---
+
+## 19. 导出 update.img 与校验
+
+```bash
+cp "$PACK/update.img" \
+   "/mnt/d/linux/sdk编译包/atk_dlrk3588_debian13_update.img"
+sync
+
+# 校验
+sha256sum "$PACK/update.img"
+sha256sum "/mnt/d/linux/sdk编译包/atk_dlrk3588_debian13_update.img"
+ls -lh "/mnt/d/linux/sdk编译包/atk_dlrk3588_debian13_update.img"
+```
+
+```text
+236e23cfa2177417da63bf66d40093eb1c4f6781226db868b85bd4a1a2382ef1  /mnt/rk3588/debian-rk3588/pack-debian-update/update.img
+236e23cfa2177417da63bf66d40093eb1c4f6781226db868b85bd4a1a2382ef1  /mnt/d/linux/sdk编译包/atk_dlrk3588_debian13_update.img
+-rwxrwxrwx 1 zzy zzy 1.2G Oct 28 20:08 /mnt/d/linux/sdk编译包/atk_dlrk3588_debian13_update.img
+```
+
+✅ **两个 SHA-256 完全一致** → 导出没有问题 ✓
+
+---
+
+## 20. 烧录上板与首次启动（WiFi / SSH）
+
+### ① 烧录
+
+用 **RKDevTool** 加载 `atk_dlrk3588_debian13_update.img` ✓ → 进入 MaskROM/Loader 模式 ✓ → 执行烧录 ✓
+
+### ② 首次启动观察
+
+烧完开机后确认：
+
+```text
+✓ 系统能正常启动
+✓ 【没有桌面、没有图形化管理界面】← 这是预期的（我们设的是 multi-user.target）
+✓ 能通过串口登录（serial-getty@ttyFIQ0）
+```
+
+> ⚠️ **我们做的是"最小系统"** ✓ —— **没有桌面是故意的** ✓
+> 目的就是先验收"**串口登录 + 网络**"这两件事 ✓
+
+### ③ 配置 WiFi
+
+先用**串口终端**登录板子 ✓，然后：
+
+```bash
+# 连接 WiFi（--ask 会交互提示输入密码）
+nmcli --ask device wifi connect "iQOO 12 Pro" ifname wlxf0a882e4993d
+```
+
+> 💡 **`wlxf0a882e4993d` 是 USB 无线网卡的接口名** ✓（`wlx` + MAC 地址 ✓）
+> 如果你用的是**板载 WiFi** ✓，接口名通常是 **`wlan0`** ✓ ——
+> 那就用 `ifname wlan0` ✓，并且需要按 [附录 B](#附录-b如果要-wifi必须在第-11-步补这一步) 补上**芯片固件** ✓
+
+**检查网络状态**：
+
+```bash
+nmcli device status
+ip addr show wlxf0a882e4993d
+```
+
+### ④ 从电脑 SSH 登录
+
+```bash
+ssh zzy@<板子IP>
+```
+
+✅ **测试通过，SSH 成功连上** ✓
+
+---
+
+## 🎯 最终成果
+
+| 产物 | 路径 | 大小 | 说明 |
+|---|---|---|---|
+| **定制 rootfs** | `D:\linux\sdk编译包\分体包\debian-rootfs.img` | 1.0 GiB | Debian 13 (trixie) / ARM64 / 内容 531 MB |
+| **完整烧录包** ⭐ | `D:\linux\sdk编译包\atk_dlrk3588_debian13_update.img` | 1.2 GiB | 可直接用 RKDevTool 烧录 |
+
+### 从零到成品的完整链路
+
+```text
+SDK 编译（B 文档）
+   └─→ U-Boot / 6.12 内核 / boot.img / loader …（其它分区）
+
+debootstrap 自制 rootfs（A 文档 1~17 步）
+   └─→ debian-rootfs.img（1.0 GiB，Debian 13）
+
+两者合并（A 文档 18~19 步）
+   └─→ atk_dlrk3588_debian13_update.img（1.2 GiB）⭐ 可烧录
+
+烧录上板（A 文档 20 步）
+   └─→ 串口登录 ✓ → 配 WiFi ✓ → SSH 登录 ✓
+```
+
 ## 附录 A：完整命令速查
 
 ```bash
@@ -958,6 +1150,40 @@ sudo umount verify-rootfs
 # ========== 17. 导出与校验 ==========
 cp -n rootfs.img "/mnt/d/linux/sdk编译包/分体包/debian-rootfs.img"
 sha256sum rootfs.img "/mnt/d/linux/sdk编译包/分体包/debian-rootfs.img"
+
+# ========== 18. 打包成 update.img ==========
+PACK=/mnt/rk3588/debian-rk3588/pack-debian-update
+SRC="/mnt/d/linux/sdk编译包/分体包"
+TOOLS=/mnt/rk3588/atk_dlrk3588_linux6.12/tools/linux/Linux_Pack_Firmware/rockdev
+
+mkdir -p "$PACK/Image"
+cp "$TOOLS/afptool" "$PACK/"
+cp "$TOOLS/rkImageMaker" "$PACK/"
+cp "$TOOLS/rk3588-package-file" "$PACK/package-file"
+
+ln -sfn "$SRC/MiniLoaderAll.bin" "$PACK/Image/MiniLoaderAll.bin"
+ln -sfn "$SRC/parameter.txt"    "$PACK/Image/parameter.txt"
+ln -sfn "$SRC/uboot.img"        "$PACK/Image/uboot.img"
+ln -sfn "$SRC/misc.img"         "$PACK/Image/misc.img"
+ln -sfn "$SRC/boot.img"         "$PACK/Image/boot.img"
+ln -sfn "$SRC/recovery.img"     "$PACK/Image/recovery.img"
+ln -sfn "$SRC/oem.img"          "$PACK/Image/oem.img"
+ln -sfn "$SRC/userdata.img"     "$PACK/Image/userdata.img"
+ln -sfn "/mnt/d/linux/sdk编译包/debian-rootfs.img" "$PACK/Image/rootfs.img"
+
+cd "$PACK"
+./afptool -pack ./ Image/update.img
+./rkImageMaker -RK3588 Image/MiniLoaderAll.bin Image/update.img update.img -os_type:androidos
+
+# ========== 19. 导出与校验 ==========
+cp "$PACK/update.img" "/mnt/d/linux/sdk编译包/atk_dlrk3588_debian13_update.img"
+sync
+sha256sum "$PACK/update.img" "/mnt/d/linux/sdk编译包/atk_dlrk3588_debian13_update.img"
+
+# ========== 20. 烧录上板后（板子上执行）==========
+nmcli --ask device wifi connect "iQOO 12 Pro" ifname wlxf0a882e4993d
+nmcli device status
+ip addr show wlxf0a882e4993d
 ```
 
 ---
@@ -1004,4 +1230,4 @@ nmcli device wifi list           # 扫描 WiFi
 
 ---
 
-> 📌 **本次成果**：`D:\linux\sdk编译包\分体包\debian-rootfs.img`（1.0 GiB，Debian 13 trixie，ARM64）
+---
