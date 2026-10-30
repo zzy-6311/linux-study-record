@@ -39,3 +39,42 @@ sed -i 's/^RK_ROOTFS_INSTALL_MODULES=y$/# RK_ROOTFS_INSTALL_MODULES is not set/'
 cd /mnt/rk3588/atk_dlrk3588_linux6.12 &&
 export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v ' ' | paste -sd ':' -)" &&（这些都是避免路径报错的）
 ./build.sh rootfs
+
+编译到最后有一个报错不复制了，提示是找不到内核，因为我们是单独编译roofs，所以没有内核是正常的，现在就需要给他这个找内核的步骤禁止，然后继续编译就好了：
+cd /mnt/rk3588/atk_dlrk3588_linux6.12 &&
+printf '\n# RK_ROOTFS_DEBUG_INFO is not set\n' >> device/rockchip/rk3588/08_zzy_rk3588_2dp_2hdmi_defconfig &&
+./build.sh 08_zzy_rk3588_2dp_2hdmi_defconfig &&
+./build.sh rootfs
+
+最终编译成功：
+saving cache in little endian encoding
+Running 99-owner.sh for /mnt/rk3588/atk_dlrk3588_linux6.12/buildroot/output/zzy_rk3588/target (buildroot init=busybox)...
+Running 30-rootfs.sh - build_buildroot /mnt/rk3588/atk_dlrk3588_linux6.12/output/buildroot/images succeeded.
+Running 30-rootfs.sh - build_rootfs rootfs succeeded.
+
+镜像的位置在：/mnt/rk3588/atk_dlrk3588_linux6.12/output/firmware/rootfs.img
+把镜像复制出来，然后就是打包到一起上板验证，但是发现原来ubuntu的内核使用的GPU驱动并不一样，因为这次的buildroot也是代图形化桌面的，我们需要使用适配的内核，所以只能重新再编译一个内核，但是前面的Loader和U-Boot是可以复用的，输入指令编译适配的内核：
+cd /mnt/rk3588/atk_dlrk3588_linux6.12 &&
+export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v ' ' | paste -sd ':' -)" &&
+./build.sh 08_zzy_rk3588_2dp_2hdmi_defconfig &&
+./build.sh kernel
+
+运行后内核编译成功了，下一步是把对应的内核模块装进 rootfs，再生成一次根文件系统镜像执行：
+cd /mnt/rk3588/atk_dlrk3588_linux6.12 &&
+sed -i 's/^# RK_ROOTFS_INSTALL_MODULES is not set$/RK_ROOTFS_INSTALL_MODULES=y/' device/rockchip/rk3588/08_zzy_rk3588_2dp_2hdmi_defconfig &&
+./build.sh 08_zzy_rk3588_2dp_2hdmi_defconfig &&
+export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v ' ' | paste -sd ':' -)" &&
+./build.sh rootfs
+
+运行后成功了就把他们打包到更新镜像：
+cd /mnt/rk3588/atk_dlrk3588_linux6.12 &&
+cp --update=none \
+  /mnt/d/linux/sdk编译包/分体包/MiniLoaderAll.bin \
+  /mnt/d/linux/sdk编译包/分体包/uboot.img \
+  /mnt/d/linux/sdk编译包/分体包/misc.img \
+  /mnt/d/linux/sdk编译包/分体包/recovery.img \
+  output/firmware/ &&
+./build.sh firmware
+
+然后就彻底运行结束，导出出来就是"D:\linux\sdk编译包\atk_dlrk3588_buildroot_update.img"的镜像有2G是因为比原来的debain的包多了图形化桌面
+现在烧录上板验证，成功开机没有问题，也是使用串口等工具先配网络，再使用ssh，然后就完工了，用户名是root，密码也是root
