@@ -503,4 +503,291 @@ md.b：在内存地址 0x02000000 看到了正确的文件内容
 
 目前确认的是这块 8＋64 板子的基础启动和读取能力，还没有完成全内存稳定性、其他容量型号以及 Linux 启动验证，但是这些复杂验证可以后面再研究，至少现在的功能没有问题了
 验证通过，U-Boot 基础阶段可以暂时收尾了，下一步就是我们自己要使用的linux内核的编译
+这次我们直接使用最新的linux的内核来完成，分两个部分来完成，首先就是先制作一个最简单的镜像，第一部分先在linux板子上面跑起来，使用串口来命令行查询，第二部分就是在跑起来的内核上面再来查询板子上面的一些外设的问题，比如emmc和wifi这种
+现在的我们就要先完成第一部分的东西，固定源码与兼容性检查和配置内核和设备树，还是先自己连接wsl以及配置工作文件盘，然后我们开始第一步，先下载我们的内核文件：
+cd G:\linux-study\linux\rk3588-task-e\downloads
+curl.exe --fail --location --retry 3 --proxy http://127.0.0.1:7890 --output linux-7.3.1.tar.xz https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.1.tar.xz
+（也可以手动下载https://www.kernel.org/，这是linux内核的官网，https://github.com/torvalds/linux这是内核的github官网）
+
+现在完成后可以使用：
+curl.exe --fail --location --retry 3 --proxy http://127.0.0.1:7890 --output "G:\linux-study\linux\rk3588-task-e\downloads\sha256sums.asc" https://cdn.kernel.org/pub/linux/kernel/v7.x/sha256sums.asc
+（进行下载的验证）
+
+然后先确认目标位置然后解压我们的内核代码：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+tar -xJf \
+  /mnt/g/linux-study/linux/rk3588-task-e/downloads/linux-7.3.1.tar.xz \
+  -C /mnt/rk3588-task-e/src
+
+通过代码确认版本和参数：
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+head -n 5 Makefile
+输出：
+# SPDX-License-Identifier: GPL-2.0
+VERSION = 7
+PATCHLEVEL = 3
+SUBLEVEL = 1
+EXTRAVERSION =
+
+版本确认是 Linux 7.3.1，源码准备完成，接下来生成内核基础配置，这一步类似之前 U-Boot 的 defconfig：告诉构建系统目标是 ARM64，先生成一份功能配置清单 .config
+这里也是采用上游 ARM64 通用配置作为起点，主要是先看一下有哪些可以参考的，然后我们再加上我们的板子特殊的东西，这样综合着节约我们的工作量：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+mkdir -p /mnt/rk3588-task-e/out/linux-zzy /mnt/rk3588-task-e/tmp &&
+export TMPDIR=/mnt/rk3588-task-e/tmp &&
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  defconfig
+（这个代码输出参数文件到我们的工作目录，一是给ai查看现在的配置参数，二是用作后面做参看和现在查看）
+
+grep -E '^CONFIG_(ARM64|ARCH_ROCKCHIP|SERIAL_8250_DW|MMC_SDHCI_OF_DWCMSHC|EXT4_FS)=' \
+  /mnt/rk3588-task-e/out/linux-zzy/.config
+输出：
+CONFIG_ARM64=y
+CONFIG_ARCH_ROCKCHIP=y
+CONFIG_SERIAL_8250_DW=y
+CONFIG_MMC_SDHCI_OF_DWCMSHC=y
+CONFIG_EXT4_FS=y
+（检查发现基础配置生成成功）
+
+运行：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+./scripts/config --file /mnt/rk3588-task-e/out/linux-zzy/.config \
+  --set-str LOCALVERSION "-zzy-minimal" \
+  --disable LOCALVERSION_AUTO \
+  --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+  --enable DEBUG_INFO_NONE
+（给自己的内核加名字：7.3.1-zzy-minimal，关闭 DWARF 调试信息）
+
+让内核配置系统整理上面的修改及其依赖：
+export TMPDIR=/mnt/rk3588-task-e/tmp
+
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  olddefconfig
+
+使用代码查看结果：
+grep -E '^(CONFIG_LOCALVERSION=|CONFIG_DEBUG_INFO_NONE=|# CONFIG_LOCALVERSION_AUTO)' \
+  /mnt/rk3588-task-e/out/linux-zzy/.config
+输出：
+CONFIG_LOCALVERSION="-zzy-minimal"
+# CONFIG_LOCALVERSION_AUTO is not set
+CONFIG_DEBUG_INFO_NONE=y
+
+现在的内核设置正确，现在来配置我们的设备树，本次先描述：
+串口：UART2 M0，1500000 波特率，与前面的硬件核对一致
+eMMC：4 位、最高 25 MHz，作为首轮验证设置
+USB：启用板载 Wi-Fi 所接的 USB2 HOST0 通路
+温度监测：启用芯片温度传感器，使用内部热关断通路
+内存容量：由启动链传递，不写死为 8 GB
+
+我们直接指令创建设备树：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+test ! -e arch/arm64/boot/dts/rockchip/rk3588-zzy-minimal.dts &&
+cat > arch/arm64/boot/dts/rockchip/rk3588-zzy-minimal.dts <<'EOF'
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/dts-v1/;
+
+/* Reuse SoC hardware definitions without CPU OPP tables for now. */
+#include "rk3588-extra.dtsi"
+
+/ {
+    model = "ZZY ATK-DLRK3588 Minimal Linux";
+    compatible = "zzy,atk-dlrk3588-minimal", "rockchip,rk3588";
+
+    aliases {
+        mmc0 = &sdhci;
+    };
+
+    chosen {
+        stdout-path = "serial2:1500000n8";
+    };
+};
+
+&uart2 {
+    pinctrl-0 = <&uart2m0_xfer>;
+    /delete-property/ dmas;
+    /delete-property/ dma-names;
+    status = "okay";
+};
+
+&sdhci {
+    bus-width = <4>;
+    max-frequency = <25000000>;
+    no-sd;
+    no-sdio;
+    non-removable;
+    /delete-property/ supports-cqe;
+    status = "okay";
+};
+
+&u2phy2 {
+    status = "okay";
+};
+
+&u2phy2_host {
+    status = "okay";
+};
+
+&usb_host0_ehci {
+    status = "okay";
+};
+
+&usb_host0_ohci {
+    status = "okay";
+};
+
+/* Internal thermal shutdown, without a PMIC shutdown GPIO. */
+&tsadc {
+    /delete-property/ pinctrl-0;
+    /delete-property/ pinctrl-1;
+    /delete-property/ pinctrl-names;
+    rockchip,hw-tshut-mode = <0>;
+    status = "okay";
+};
+EOF
+
+把设备树列入到我们的内核构建列表：
+grep -qF 'rk3588-zzy-minimal.dtb' arch/arm64/boot/dts/rockchip/Makefile ||
+printf '\ndtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-zzy-minimal.dtb\n' \
+  >> arch/arm64/boot/dts/rockchip/Makefile
+
+只编译这一份设备树：
+export TMPDIR=/mnt/rk3588-task-e/tmp
+
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  rockchip/rk3588-zzy-minimal.dtb
+
+可以通过指令查看产物：/mnt/rk3588-task-e/src/linux-7.3.1$ ls -lh /mnt/rk3588-task-e/out/linux-zzy/arch/arm64/boot/dts/rockchip/rk3588-zzy-minimal.dtb
+输出：
+-rw-r--r-- 1 zzy zzy 89K Nov  2 20:29 /mnt/rk3588-task-e/out/linux-zzy/arch/arm64/boot/dts/rockchip/rk3588-zzy-minimal.dtb
+
+下一步是裁剪内核配置，通用配置还启用了大量其他厂商的平台，以及图形、音频等功能，温度监测和无线基础框架才默认是模块不启用，所以我们要裁剪掉这些不需要的，调整的目标是：
+芯片平台只保留：Rockchip	减少无关平台代码
+关闭图形、音频、摄像头、蓝牙、PCIe、SATA、以太网驱动框架：聚焦串口、eMMC、USB Wi-Fi
+无线基础框架、温度监测编入内核：初次启动不需要先加载这些模块
+暂时关闭 CPU 和设备动态调频：配合目前尚未完整适配的电源描述
+保留模块加载能力：后面使用自己编译的 Wi-Fi 驱动
+
+先关闭其他芯片：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+./scripts/config --file /mnt/rk3588-task-e/out/linux-zzy/.config \
+  --disable ARCH_ACTIONS --disable ARCH_AIROHA \
+  --disable ARCH_SUNXI --disable ARCH_ALPINE \
+  --disable ARCH_APPLE --disable ARCH_ARTPEC \
+  --disable ARCH_ASPEED --disable ARCH_AXIADO \
+  --disable ARCH_BCM --disable ARCH_BCM2835 \
+  --disable ARCH_BCM_IPROC --disable ARCH_BCMBCA \
+  --disable ARCH_BRCMSTB --disable ARCH_BERLIN \
+  --disable ARCH_BLAIZE --disable ARCH_BST \
+  --disable ARCH_CIX --disable ARCH_EXYNOS \
+  --disable ARCH_K3 --disable ARCH_LG1K \
+  --disable ARCH_HISI --disable ARCH_KEEMBAY \
+  --disable ARCH_MEDIATEK --disable ARCH_MESON \
+  --disable ARCH_MICROCHIP --disable ARCH_SPARX5 \
+  --disable ARCH_MVEBU --disable ARCH_NXP \
+  --disable ARCH_LAYERSCAPE --disable ARCH_MXC \
+  --disable ARCH_S32 --disable ARCH_MA35 \
+  --disable ARCH_NPCM --disable ARCH_QCOM \
+  --disable ARCH_REALTEK --disable ARCH_RENESAS \
+  --disable ARCH_SEATTLE --disable ARCH_INTEL_SOCFPGA \
+  --disable ARCH_SOPHGO --disable ARCH_STM32 \
+  --disable ARCH_SYNQUACER --disable ARCH_TEGRA \
+  --disable ARCH_TESLA_FSD --disable ARCH_SPRD \
+  --disable ARCH_THUNDER --disable ARCH_THUNDER2 \
+  --disable ARCH_UNIPHIER --disable ARCH_VEXPRESS \
+  --disable ARCH_VISCONTI --disable ARCH_XGENE \
+  --disable ARCH_ZYNQMP \
+  --enable ARCH_ROCKCHIP
+
+调整功能和驱动：
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+./scripts/config --file /mnt/rk3588-task-e/out/linux-zzy/.config \
+  --disable DRM \
+  --disable FB \
+  --disable SOUND \
+  --disable MEDIA_SUPPORT \
+  --disable BT \
+  --disable PCI \
+  --disable ATA \
+  --disable ETHERNET \
+  --disable USB_NET_DRIVERS \
+  --disable CPU_FREQ \
+  --disable PM_DEVFREQ \
+  --enable CFG80211 \
+  --enable RFKILL \
+  --enable ROCKCHIP_THERMAL \
+  --enable MODULES &&
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  olddefconfig
+/*
+CFG80211：Linux 的无线配置框架，后续 Wi-Fi 驱动需要与它配合
+RFKILL：无线设备开关控制框架
+ROCKCHIP_THERMAL：瑞芯微温度传感器驱动
+USB_NET_DRIVERS：另一类 USB 网络适配器驱动集合，关闭它不会关闭 USB 主机控制器或整个无线驱动框架
+*/
+
+整理依赖并检查结果：
+export TMPDIR=/mnt/rk3588-task-e/tmp
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  olddefconfig
+然后：
+grep -E '^(CONFIG_(ARCH_ROCKCHIP|CFG80211|RFKILL|ROCKCHIP_THERMAL|MODULES)=|# CONFIG_(DRM|SOUND|MEDIA_SUPPORT|BT|PCI|ATA|ETHERNET|CPU_FREQ|PM_DEVFREQ) is not set)' \
+  /mnt/rk3588-task-e/out/linux-zzy/.config
+输出：
+CONFIG_ARCH_ROCKCHIP=y
+# CONFIG_CPU_FREQ is not set
+CONFIG_MODULES=y
+# CONFIG_BT is not set
+CONFIG_CFG80211=y
+CONFIG_RFKILL=y
+# CONFIG_PCI is not set
+# CONFIG_ATA is not set
+# CONFIG_ETHERNET is not set
+CONFIG_ROCKCHIP_THERMAL=y
+# CONFIG_MEDIA_SUPPORT is not set
+# CONFIG_DRM is not set
+# CONFIG_SOUND is not set
+
+还有一点补充设置：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+export TMPDIR=/mnt/rk3588-task-e/tmp &&
+./scripts/config --file /mnt/rk3588-task-e/out/linux-zzy/.config \
+  --disable SCSI_UFSHCD \
+  --disable PM_DEVFREQ &&
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  olddefconfig
+（默认的 UFS 存储驱动会重新开启设备调频框架，这块板使用 eMMC，因此一起关闭 UFS）
+
+然后我们开始编译（采用四个并行任务，控制内存占用）：
+set -o pipefail
+
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  -j4 Image rockchip/rk3588-zzy-minimal.dtb \
+  2>&1 | tee "/mnt/rk3588-task-e/logs/linux-image-$(date +%Y%m%d-%H%M%S).log"
+
+task_build_status=${PIPESTATUS[0]}
+printf '内核编译返回码：%s\n' "$task_build_status"
 
