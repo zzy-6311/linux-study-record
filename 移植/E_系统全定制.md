@@ -791,3 +791,82 @@ make O=/mnt/rk3588-task-e/out/linux-zzy \
 task_build_status=${PIPESTATUS[0]}
 printf '内核编译返回码：%s\n' "$task_build_status"
 
+完成后我们最原始的最小内核就编译成功了，但是要验证是否成功还需要一个最小根文件系统。不然不能进入系统，因为内核没有uboot那样的命令行，需要检查内核是否完好，需要在roofs里面来检测，所以我们先来使用buildroot来创建roofs，先下载buildroot的源码：
+（github的发布地址是：https://gitlab.com/buildroot.org/buildroot/；官网在：https://buildroot.org/download.html）
+curl.exe --fail --location --retry 3 --proxy http://127.0.0.1:7890 --output "G:\linux-study\linux\rk3588-task-e\downloads\buildroot-2026.08.1.tar.xz" https://buildroot.org/downloads/buildroot-2026.08.1.tar.xz
+
+命令下载完成后，回到wsl进行解压到我们的工作区：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+tar -xJf \
+  /mnt/g/linux-study/linux/rk3588-task-e/downloads/buildroot-2026.08.1.tar.xz \
+  -C /mnt/rk3588-task-e/src &&
+cd /mnt/rk3588-task-e/src/buildroot-2026.08.1 &&
+grep -n '^export BR2_VERSION' Makefile
+
+然后就要来配置我们的buildroot系统：
+目标架构：AArch64 小端//生成 RK3588 可以运行的 64 位程序
+工具链：Buildroot toolchain//由 Buildroot 构建与用户空间配套的交叉编译工具链
+C 库：musl//提供 BusyBox 等程序需要的基础库，适合小型系统
+
+打开配置菜单，并且先进行一点小设置：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/buildroot-2026.08.1 &&
+mkdir -p /mnt/rk3588-task-e/out/buildroot-minimal \
+  /mnt/rk3588-task-e/tmp \
+  /mnt/rk3588-task-e/cache/buildroot-dl &&
+export TMPDIR=/mnt/rk3588-task-e/tmp &&
+export BR2_DL_DIR=/mnt/rk3588-task-e/cache/buildroot-dl &&
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin &&
+make O=/mnt/rk3588-task-e/out/buildroot-minimal menuconfig
+
+进入蓝色配置行，先进入Target options，进入Target Architecture (i386)里面来选择平台选择AArch64 (little endian)//这里还有个big endian区别是大小端字节序，我们就用小端
+现在返回最初页面，然后进入Toolchain，找到C library，进入修改成musl
+然后再返回最初页面，选择System configuration，进入修改：
+System hostname：zzy-rk3588（板子的主机名）
+System banner：Welcome to ZZY RK3588 Linux（登录前显示的欢迎文字）
+Root password：1234（串口登录密码）
+然后在这一页进入Run a getty (login prompt) after boot，TTY port改成ttyS2
+然后返回最主页进入Filesystem images，选择cpio the root filesystem (for use as an initial RAM filesystem)，按空格选中出现子选项，下面：
+cpio type选择cpio the whole root filesystem，Compression method选择gzip，Create U-Boot image of the root filesystem不勾选
+然后下面的[*] tar the root filesystem按下空格改成不选中
+然后保存退出，通过指令查询是否设置正确：
+grep -E '^BR2_(aarch64|TOOLCHAIN_BUILDROOT|TOOLCHAIN_BUILDROOT_MUSL|INIT_BUSYBOX|PACKAGE_BUSYBOX|TARGET_GENERIC_HOSTNAME|TARGET_GENERIC_GETTY_PORT|TARGET_GENERIC_GETTY_BAUDRATE|TARGET_ROOTFS_CPIO|TARGET_ROOTFS_CPIO_FULL|TARGET_ROOTFS_CPIO_GZIP|LINUX_KERNEL|TARGET_UBOOT)=' \
+  /mnt/rk3588-task-e/out/buildroot-minimal/.config
+输出：
+BR2_aarch64=y
+BR2_TOOLCHAIN_BUILDROOT=y
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+BR2_TARGET_GENERIC_HOSTNAME="zzy-rk3588"
+BR2_INIT_BUSYBOX=y
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS2"
+BR2_TARGET_GENERIC_GETTY_BAUDRATE="0"
+BR2_PACKAGE_BUSYBOX=y
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_FULL=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+这些设置意思是：
+BR2_aarch64=y：为板子生成 ARM64 小端程序
+BR2_TOOLCHAIN_BUILDROOT=y：由 Buildroot 构建交叉编译工具链，用电脑编译板上的程序
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y：使用 musl C 库，为程序提供基础运行支持
+BR2_TARGET_GENERIC_HOSTNAME="zzy-rk3588"：系统主机名
+BR2_INIT_BUSYBOX=y：使用 BusyBox 的 init 管理启动流程、启动登录终端
+BR2_PACKAGE_BUSYBOX=y：安装 BusyBox，提供 shell、`ls`、`cat`、`mount` 等基础命令
+BR2_TARGET_GENERIC_GETTY_PORT="ttyS2"：在 UART2 对应的终端提供登录提示
+BR2_TARGET_GENERIC_GETTY_BAUDRATE="0"：保留内核设置的波特率，不是串口速度为零
+BR2_TARGET_ROOTFS_CPIO=y：将根文件系统打包成 cpio
+BR2_TARGET_ROOTFS_CPIO_FULL=y：打包整个根文件系统
+BR2_TARGET_ROOTFS_CPIO_GZIP=y：使用 gzip 压缩，最终生成 rootfs.cpio.gz
+
+因为现在的这个buildroot只是一个配置目录类型的，所以他在构建的过程中还需要各种下载类似gcc一类的工具，所以还需要解决网络的问题，这个不记录了，反正解决网络连接后，把前面的环境全部复位就开始编译一个mini版本：
+set -o pipefail
+
+make O=/mnt/rk3588-task-e/out/buildroot-minimal \
+  BR2_DL_DIR=/mnt/rk3588-task-e/cache/buildroot-dl \
+  BR2_JLEVEL=4 \
+  2>&1 | tee "/mnt/rk3588-task-e/logs/buildroot-minimal-$(date +%Y%m%d-%H%M%S).log"
+
+task_build_status=${PIPESTATUS[0]}
+printf 'Buildroot 构建返回码：%s\n' "$task_build_status"
+
