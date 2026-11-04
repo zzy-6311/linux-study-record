@@ -870,3 +870,307 @@ make O=/mnt/rk3588-task-e/out/buildroot-minimal \
 task_build_status=${PIPESTATUS[0]}
 printf 'Buildroot 构建返回码：%s\n' "$task_build_status"
 
+编译完了，我们整理一下启动文件准备打包：
+rootdir=/mnt/rk3588-task-e/out/buildroot-minimal/build/buildroot-fs/cpio/target
+table='/mnt/rk3588-task-e/out/buildroot-minimal/build/buildroot-fs/full_devices_table.txt'
+PATH="/mnt/rk3588-task-e/out/buildroot-minimal/host/bin:/mnt/rk3588-task-e/out/buildroot-minimal/host/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" gzip -9 -c -n /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio > /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio.gz
+ln -snf /mnt/rk3588-task-e/out/buildroot-minimal/host/aarch64-buildroot-linux-musl/sysroot /mnt/rk3588-task-e/out/buildroot-minimal/staging
+Buildroot 构建返回码：0
+zzy@LAPTOP-4S39SRHC:/mnt/rk3588-task-e/src/buildroot-2026.08.1$ ls -lh /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio.gz
+-rw-r--r-- 1 zzy zzy 974K Nov  3 22:44 /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio.gz
+
+配置启动配置：
+cat > /mnt/rk3588-task-e/out/boot-test/files/extlinux/extlinux.conf <<'EOF'
+DEFAULT zzy-linux
+TIMEOUT 30
+
+LABEL zzy-linux
+    MENU LABEL ZZY RK3588 Minimal Linux
+    LINUX /Image
+    FDT /rockchip/rk3588-zzy-minimal.dtb
+    INITRD /rootfs.cpio.gz
+    APPEND console=ttyS2,1500000n8 earlycon rdinit=/init loglevel=7
+EOF
+（加载指定的内核、设备树和 initramfs
+Linux 使用 ttyS2，串口速率为 1500000
+启动后执行根文件系统里的 /init
+输出较详细的早期启动日志，便于定位问题）
+
+制作64MB的启动镜像：
+test ! -e /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img &&
+truncate -s 64M /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img &&
+mkfs.ext4 -F -L zzy-boot \
+  -d /mnt/rk3588-task-e/out/boot-test/files \
+  /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img
+
+检查：
+ls -lh /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img
+debugfs -R 'cat /extlinux/extlinux.conf' \
+  /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img
+
+出现了报错，是前面的启动文件整理尚未完成，`out/boot-test` 目录和启动配置都不存在，修复一下，创建目录：
+mkdir -p /mnt/rk3588-task-e/out/boot-test/files/rockchip \
+  /mnt/rk3588-task-e/out/boot-test/files/extlinux &&
+cp /mnt/rk3588-task-e/out/linux-zzy/arch/arm64/boot/Image \
+  /mnt/rk3588-task-e/out/boot-test/files/ &&
+cp /mnt/rk3588-task-e/out/linux-zzy/arch/arm64/boot/dts/rockchip/rk3588-zzy-minimal.dtb \
+  /mnt/rk3588-task-e/out/boot-test/files/rockchip/ &&
+cp /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio.gz \
+  /mnt/rk3588-task-e/out/boot-test/files/
+
+写入启动配置：
+cat > /mnt/rk3588-task-e/out/boot-test/files/extlinux/extlinux.conf <<'EOF'
+DEFAULT zzy-linux
+TIMEOUT 30
+
+LABEL zzy-linux
+    MENU LABEL ZZY RK3588 Minimal Linux
+    LINUX /Image
+    FDT /rockchip/rk3588-zzy-minimal.dtb
+    INITRD /rootfs.cpio.gz
+    APPEND console=ttyS2,1500000n8 earlycon rdinit=/init loglevel=7
+EOF
+
+重新创建镜像：
+test ! -e /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img &&
+truncate -s 64M /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img &&
+mkfs.ext4 -F -L zzy-boot \
+  -d /mnt/rk3588-task-e/out/boot-test/files \
+  /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img
+
+再重新检查：
+ls -lh /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img
+debugfs -R 'cat /extlinux/extlinux.conf' \
+  /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img
+
+这次没有问题，重新导出：
+mkdir -p /mnt/g/linux-study/linux/rk3588-task-e/artifacts &&
+cp --sparse=always \
+  /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img \
+  /mnt/g/linux-study/linux/rk3588-task-e/artifacts/linux-boot-test.img &&
+cmp \
+  /mnt/rk3588-task-e/out/boot-test/linux-boot-test.img \
+  /mnt/g/linux-study/linux/rk3588-task-e/artifacts/linux-boot-test.img &&
+echo "启动镜像导出并校验通过"
+
+文件在：G:\linux-study\linux\rk3588-task-e\artifacts\linux-boot-test.img
+现在来烧录，这次需要烧录boot，还是勾选boot，然后选择emmc，改地址是0x00008000，然后选中我们的镜像路径，勾选强制按地址写，然后烧录（这次板子不知道为什么不能识别我的usb，所以只能uboot串口发送rockusb 0 mmc 0，进入的烧录）
+现在出现了大问题，没办法烧录，报错找不到flash，因为我们的uboot里面的烧录流程不是使用的瑞芯微的那一套，所以需要使用临时初始化uboot来烧录
+先命令：
+cd /mnt/rk3588-task-e/src/rkbin-3e288fe &&
+./tools/boot_merger RKBOOT/RK3588MINIALL.ini
+（创建文件按这份配置组合组件）
+
+确认生成结果导出到G盘：
+ls -lh /mnt/rk3588-task-e/src/rkbin-3e288fe/rk3588_loader_v1.24.114.bin &&
+mkdir -p /mnt/g/linux-study/linux/rk3588-task-e/artifacts &&
+cp /mnt/rk3588-task-e/src/rkbin-3e288fe/rk3588_loader_v1.24.114.bin \
+  /mnt/g/linux-study/linux/rk3588-task-e/artifacts/ &&
+cmp /mnt/rk3588-task-e/src/rkbin-3e288fe/rk3588_loader_v1.24.114.bin \
+  /mnt/g/linux-study/linux/rk3588-task-e/artifacts/rk3588_loader_v1.24.114.bin &&
+echo "下载 Loader 导出并校验通过"
+
+就生成到了G:\linux-study\linux\rk3588-task-e\artifacts\rk3588_loader_v1.24.114.bin
+（其实前面的按音量键进入烧录有问题，那都是原来系统特制的，真正的板子复位是按着UPDATE重启，这次成功直接进入了MASKROM，但是还是不能烧录原来的东西，继续尝试新方案）
+我们现在就是要给现在的板子烧录一个临时的loader接管我们的烧录，把这个单独的临时loader烧录进去，在烧录界面只勾选第一行的loader，然后烧录地址和位置等都不变，选中我们刚才生成的文件，烧录进去
+下一步把前面的loader和uboot还有boot一起勾选，一起烧录，三部分的功能是：
+Loader：建立 USB 下载和 eMMC 访问通道；工具还会处理 IDB。
+Uboot：恢复我们自己编译、已验证过的启动链。
+Boot：写入 Linux 内核、设备树、BusyBox 根文件系统和启动配置。
+
+这次成功的烧录了，下一步就是验证 U-Boot 能否加载 Linux，并进入最小系统的串口登录界面，现在正常重启，但是只能进入uboot的空间，也就是uboot不能成功的找到我们的linux内核
+此处省略一些检查的命令，只解释我们的结论：
+ext4ls mmc 0:3 /：能看到内核、设备树目录、根文件系统-Boot 分区位置正确，ext4 可以读取
+查看 /extlinux/：存在 extlinux.conf-启动配置没有漏打包
+查看启动环境变量：目标是 mmc0，方法是 extlinux-基本启动设置存在
+指定 mmc0:3 扫描：仍然没有启动项-仅指定分区不足以解决
+bootdev list、`bootmeth list`：有 eMMC 启动设备和 extlinux 方法-不是这两项完全缺失
+
+所以我们只能手动启动里面的这个最小设备，绕过了自动扫描和 extlinux 配置解析，手动完成它们原本应当做的事情
+用 ext4load 把 Image 从 eMMC 读入内存，把设备树读入另一块内存，把 rootfs.cpio.gz 读入内存，并记录文件大小，设置启动参数，指定串口和初始程序 /init
+使用手动烧录终于成功的打开了我们创建的最小系统，但是现在是手动开启的，没有全自动的启动流程，所以关机重启就没有这个功能了
+但是现在这个的成功登录成功的验证了内核和根文件系统能在这块板上运行，后面就在这套成果上补齐自动启动、Wi-Fi 和 SSH 就算完工了
+
+现在来尝试补齐这三个，现在有了最小的系统了，现在就开始下一步，使用命令检查一下wifi：
+cat /sys/bus/usb/devices/2-1/idVendor
+cat /sys/bus/usb/devices/2-1/idProduct
+cat /sys/bus/usb/devices/2-1/product
+
+这就确认了板载 Wi-Fi 的驱动方向：RTL8733BU，实际设备 ID 是 0bda:b733，与原理图信息一致核对了候选驱动源码，它的 RTL8733B 设备表明确包含 b733，下一步要让无线驱动绑定它，才会出现可用的无线网络接口，我们采用github的 rtl8733bu 源码（https://github.com/wirenboard/rtl8733bu），先windous下载驱动源码：
+curl.exe --fail --location --retry 3 --proxy http://127.0.0.1:7890 --output "G:\linux-study\linux\rk3588-task-e\downloads\rtl8733bu-2d9048be.tar.gz" https://codeload.github.com/wirenboard/rtl8733bu/tar.gz/2d9048be60759206b8db5e2370420333ef0b8478
+
+然后在wsl：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+tar -xzf \
+  /mnt/g/linux-study/linux/rk3588-task-e/downloads/rtl8733bu-2d9048be.tar.gz \
+  -C /mnt/rk3588-task-e/src
+（确认工作磁盘挂载正确，再把源码解压到其中）
+
+进入源码目录，确认无线芯片配置：
+cd /mnt/rk3588-task-e/src/rtl8733bu-2d9048be60759206b8db5e2370420333ef0b8478 &&
+grep -nE '^CONFIG_(RTL8733B|USB_HCI|PLATFORM_WB7)[[:space:]]*=' Makefile
+输出：
+60:CONFIG_RTL8733B = y
+62:CONFIG_USB_HCI = y
+152:CONFIG_PLATFORM_WB7 = y
+
+这三项正确，驱动源码已经就位，开始编译 Wi-Fi 驱动前，还需要补齐内核的模块构建结果：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/linux-7.3.1 &&
+export TMPDIR=/mnt/rk3588-task-e/tmp &&
+make O=/mnt/rk3588-task-e/out/linux-zzy \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  -j4 modules
+
+结束检查：
+echo "内核模块编译返回码：$?"
+ls -lh /mnt/rk3588-task-e/out/linux-zzy/Module.symvers
+输出：
+内核模块编译返回码：0
+-rw-r--r-- 1 zzy zzy 820K Nov  4 22:10 /mnt/rk3588-task-e/out/linux-zzy/Module.symvers
+
+说明没有问题了，可以开始编译 Wi-Fi 驱动：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+cd /mnt/rk3588-task-e/src/rtl8733bu-2d9048be60759206b8db5e2370420333ef0b8478 &&
+export TMPDIR=/mnt/rk3588-task-e/tmp &&
+make -j4 \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  KVER=7.3.1-zzy-minimal \
+  KSRC=/mnt/rk3588-task-e/out/linux-zzy \
+  M="$PWD" \
+  modules 2>&1 | tee /mnt/rk3588-task-e/logs/rtl8733bu-build-first.log
+
+task_wifi_status=${PIPESTATUS[0]}
+echo "Wi-Fi 驱动编译返回码：$task_wifi_status"
+
+报错了，旧驱动传递编译参数的方式与 Linux 7.3.1 不兼容，开始修改：
+cd /mnt/rk3588-task-e/src/rtl8733bu-2d9048be60759206b8db5e2370420333ef0b8478 &&
+cp --update=none Makefile Makefile.before-linux7
+然后：
+grep -Fqx 'ccflags-y += $(EXTRA_CFLAGS)' Makefile ||
+printf '\n# Pass legacy driver flags to current Kbuild\nccflags-y += $(EXTRA_CFLAGS)\n' >> Makefile
+（将驱动已有的头文件路径和功能宏传给新构建系统）
+
+重新编译，并保存新的日志：
+export TMPDIR=/mnt/rk3588-task-e/tmp
+
+make -j4 \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  KVER=7.3.1-zzy-minimal \
+  KSRC=/mnt/rk3588-task-e/out/linux-zzy \
+  M="$PWD" \
+  modules 2>&1 | tee /mnt/rk3588-task-e/logs/rtl8733bu-build-second.log
+
+task_wifi_status=${PIPESTATUS[0]}
+echo "Wi-Fi 驱动编译返回码：$task_wifi_status"
+
+还有点问题，继续修改：
+sed -i 's|-I$(src)/|-I$(abspath $(src))/|g' Makefile
+然后：
+grep -nF -- '-I$(abspath $(src))/include' Makefile
+（把驱动的头文件路径明确写成绝对路径，避免被这段逻辑误转换）
+
+再次编译：
+make -j4 \
+  ARCH=arm64 \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  KVER=7.3.1-zzy-minimal \
+  KSRC=/mnt/rk3588-task-e/out/linux-zzy \
+  M="$PWD" \
+  modules 2>&1 | tee /mnt/rk3588-task-e/logs/rtl8733bu-build-third.log
+
+task_wifi_status=${PIPESTATUS[0]}
+echo "Wi-Fi 驱动编译返回码：$task_wifi_status"
+
+还是有问题，在当前 WSL 驱动目录中，备份并修改这个头文件：
+cp --update=none \
+  include/osdep_service_linux.h \
+  include/osdep_service_linux.h.before-linux7 &&
+sed -i \
+  -e 's/\bfrom_timer(/timer_container_of(/g' \
+  -e 's/\bdel_timer_sync(/timer_delete_sync(/g' \
+  -e 's/\bdel_timer(/timer_delete(/g' \
+  include/osdep_service_linux.h
+
+检查：
+grep -nE 'timer_container_of|timer_delete_sync|timer_delete\(' \
+  include/osdep_service_linux.h
+输出：
+371:    _timer *ptimer = timer_container_of(ptimer, in_timer, timer);
+400:    *bcancelled = timer_delete_sync(&ptimer->timer) == 1 ? 1 : 0;
+405:    timer_delete(&ptimer->timer);
+
+继续编译还是有问题，直接用ai批量检查源码修改，直接跳过这个驱动的修改，ai直接改好了，我们下一步，把这个驱动放到我们的buildroot里面：
+test "$(findmnt -n -o UUID --mountpoint /mnt/rk3588-task-e)" = \
+  "f0c827b8-89bf-4b52-b620-d6b51c803569" &&
+mkdir -p /mnt/rk3588-task-e/configs/rootfs-overlay/lib/modules/7.3.1-zzy-minimal/extra &&
+install -m 644 \
+  /mnt/rk3588-task-e/src/rtl8733bu-2d9048be60759206b8db5e2370420333ef0b8478/8733bu.ko \
+  /mnt/rk3588-task-e/configs/rootfs-overlay/lib/modules/7.3.1-zzy-minimal/extra/
+然后告诉 Buildroot 使用这个 overlay：
+cd /mnt/rk3588-task-e/src/buildroot-2026.08.1 &&
+./utils/config \
+  --file /mnt/rk3588-task-e/out/buildroot-minimal/.config \
+  --set-str BR2_ROOTFS_OVERLAY \
+  "/mnt/rk3588-task-e/configs/rootfs-overlay" &&
+make O=/mnt/rk3588-task-e/out/buildroot-minimal olddefconfig
+增量构建根文件系统：
+export TMPDIR=/mnt/rk3588-task-e/tmp
+
+make O=/mnt/rk3588-task-e/out/buildroot-minimal \
+  BR2_DL_DIR=/mnt/rk3588-task-e/cache/buildroot-dl \
+  BR2_JLEVEL=4 \
+  2>&1 | tee /mnt/rk3588-task-e/logs/buildroot-with-wifi-module.log
+
+task_rootfs_status=${PIPESTATUS[0]}
+echo "根文件系统构建返回码：$task_rootfs_status"
+
+有点环境问题，改一下下：
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export TMPDIR=/mnt/rk3588-task-e/tmp
+
+重新运行构建：
+make O=/mnt/rk3588-task-e/out/buildroot-minimal \
+  BR2_DL_DIR=/mnt/rk3588-task-e/cache/buildroot-dl \
+  BR2_JLEVEL=4 \
+  2>&1 | tee /mnt/rk3588-task-e/logs/buildroot-with-wifi-module.log
+
+task_rootfs_status=${PIPESTATUS[0]}
+echo "根文件系统构建返回码：$task_rootfs_status"
+
+返回码为 0 后，再检查镜像内容：
+ls -lh /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio.gz
+gzip -dc /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio.gz \
+  | cpio -t 2>/dev/null \
+  | grep '8733bu.ko'
+输出：
+-rw-r--r-- 1 zzy zzy 1.9M Nov  4 22:39 /mnt/rk3588-task-e/out/buildroot-minimal/images/rootfs.cpio.gz
+lib/modules/7.3.1-zzy-minimal/extra/8733bu.ko
+
+驱动已经打进新 rootfs，结果正确，本来应该此时上板验证的，但是太慢了，我们直接把3个部分一起完成再来上板验证，直接省略大量的命令行操作，说内容：
+U-Boot自启动固定，改成开机直接从 eMMC 第 3 分区读取 Image 和设备树，再读取第 8 分区的 UUID，传给 Linux，最后执行 booti
+linux的内核和设备树直接沿用上一版本
+补齐连接 Wi-Fi 和 SSH 所需的软件：
+  iw：查看无线设备、扫描等诊断
+  wpa_supplicant：与热点完成认证和连接
+  wpa_cli、`wpa_passphrase`：在串口配置热点、生成密码配置
+  BusyBox udhcpc：向路由器获取 IP、网关和 DNS
+  wireless-regdb：补上此前缺少的无线监管数据库
+  Dropbear：提供 SSH 登录服务
+开机服务：把这些程序按顺序运行起来，新增 S41wifi 启动脚本：加载驱动 → 等待 wlan0 → 启动无线连接程序 → 在后台请求 IP
+根文件系统：从“内存试运行”改成“eMMC 持久保存”，让 Buildroot 另外生成一个 256 MiB 的 ext4 rootfs 镜像，准备写入现有 rootfs 分区；Linux 直接以它作为 /
+
+现在我们来烧录ai编译完的新镜像，所有文件都在G:\linux-study\linux\rk3588-task-e\artifacts\integrated-wifi-ssh，烧录文件：
+Loader	0x00000000	rk3588_loader_v1.24.114.bin
+Uboot	0x00000040	u-boot-rockchip.bin
+Boot	0x00008000	boot-integrated.img
+Rootfs（可以使用 System 行）	0x008B8000	rootfs-integrated.ext4
+
+烧录完成后直接串口进入，输入root登录用户，输入密码，然后用指令检测：uname -r、mount | grep ' on / '、lsmod、ip link show wlan0、dmesg | tail -n 80
+检查没有问题，尝试扫描连接wifi，使用指令连接wifi，连接成功，手动保存到emmc，保证下次开机可以直接连接，然后通过ip，成功连接到ssh，完成我们的阶段成功
