@@ -1,0 +1,310 @@
+这测我们来学习如何对已有的镜像做裁剪，降低包大小
+还是先进入wsl，然后复制我们windous盘上的B文档里面编译出来的ubuntu根目录包：
+mkdir -p ~/rk3588-task-d/{images,rootfs,logs} &&
+cp --update=none --sparse=always \
+  "/mnt/d/linux/sdk编译包/分体包/ubuntu-rootfs.img" \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img &&
+cmp \
+  "/mnt/d/linux/sdk编译包/分体包/ubuntu-rootfs.img" \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img &&
+echo "工作副本校验通过"
+
+我们先把ubuntu文件挂载到我们的wsl系统里面：
+sudo mount -o loop,ro,noload \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img \
+  ~/rk3588-task-d/rootfs
+（ubuntu-rootfs-work.img 是一个包含 ext4 文件系统的镜像文件，里面不仅有文件内容，还有目录结构、所有者、权限等信息，挂载后，WSL 能通过 rootfs 这个目录访问镜像内部）
+
+然后我们通过挂载来检查：df -h ~/rk3588-task-d/rootfs（这个是看一下这整个文件占多少）
+然后：
+sudo du -x -h --max-depth=1 ~/rk3588-task-d/rootfs \
+  | sort -h \
+  | tee ~/rk3588-task-d/logs/usage-before.txt
+  就可以看到输出：
+  zzy@LAPTOP-4S39SRHC:/mnt/c/Users/youyou$ sudo du -x -h --max-depth=1 ~/rk3588-task-d/rootfs \
+  | sort -h \
+  | tee ~/rk3588-task-d/logs/usage-before.txt
+4.0K    /home/zzy/rk3588-task-d/rootfs/boot
+4.0K    /home/zzy/rk3588-task-d/rootfs/media
+4.0K    /home/zzy/rk3588-task-d/rootfs/mnt
+4.0K    /home/zzy/rk3588-task-d/rootfs/oem
+4.0K    /home/zzy/rk3588-task-d/rootfs/proc
+4.0K    /home/zzy/rk3588-task-d/rootfs/srv
+4.0K    /home/zzy/rk3588-task-d/rootfs/userdata
+12K     /home/zzy/rk3588-task-d/rootfs/tmp
+16K     /home/zzy/rk3588-task-d/rootfs/dev
+16K     /home/zzy/rk3588-task-d/rootfs/lost+found
+20K     /home/zzy/rk3588-task-d/rootfs/home
+20K     /home/zzy/rk3588-task-d/rootfs/opt
+20K     /home/zzy/rk3588-task-d/rootfs/root
+24K     /home/zzy/rk3588-task-d/rootfs/sys
+96K     /home/zzy/rk3588-task-d/rootfs/run
+6.5M    /home/zzy/rk3588-task-d/rootfs/info
+13M     /home/zzy/rk3588-task-d/rootfs/rockchip-test
+40M     /home/zzy/rk3588-task-d/rootfs/etc
+458M    /home/zzy/rk3588-task-d/rootfs/var
+2.2G    /home/zzy/rk3588-task-d/rootfs/usr
+2.7G    /home/zzy/rk3588-task-d/rootfs
+
+这就是ubuntu里面各个分区的大小，就可以发现主要大小是在usr文件夹，检查完了准备动手，先切换成可修改模式：
+sudo umount ~/rk3588-task-d/rootfs &&
+sudo mount -o loop,rw \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img \
+  ~/rk3588-task-d/rootfs &&
+findmnt --mountpoint ~/rk3588-task-d/rootfs
+
+我准备制作一个通过串口和 SSH 管理的精简 Ubuntu，删除桌面、浏览器、蓝牙服务、音频服务、多媒体应用、打印扫描支持等，先让ai扫描一下有那些包
+现在我们要开始进行裁剪，现在这个镜像还是个文件的形式，所以我们需要挂载镜像，让我们能访问Ubuntu的文件，上一步就是这个工作，然后我们需要把控件的运行接口进行挂载，让镜像里的程序有条件运行，也就是可以通过其中的接口文件控制：
+task_root="$HOME/rk3588-task-d/rootfs"
+
+sudo mount --rbind /dev "$task_root/dev" &&
+sudo mount --make-rslave "$task_root/dev" &&
+sudo mount -t proc -o nosuid,nodev,noexec proc "$task_root/proc" &&
+sudo mount --bind /sys "$task_root/sys" &&
+sudo mount -o remount,bind,ro "$task_root/sys" &&
+printf '#!/bin/sh\nexit 101\n' \
+  | sudo tee "$task_root/usr/sbin/policy-rc.d" >/dev/null &&
+sudo chmod 755 "$task_root/usr/sbin/policy-rc.d"
+
+我们可以检验一下，通过下面代码：
+sudo chroot "$task_root" /usr/bin/dpkg --print-architecture
+sudo chroot "$task_root" /bin/cat /etc/os-release
+（看到arm64和PRETTY_NAME="Ubuntu 26.04.1 LTS"系统信息，这说明WSL正在借助QEMU，运行工作镜像中的ARM64程序，并读取镜像中的系统配置）
+
+现在我们准备删除图形化桌面，但是直接删除桌面及其应用，容易被机器吧一些我们还要的东西也当成是桌面的支持包一起删除，所以先给不用删除的东西做记录，标明非删除目标：
+sudo chroot ~/rk3588-task-d/rootfs apt-mark manual \
+  apt dpkg ubuntu-keyring ca-certificates \
+  openssh-server openssh-client openssh-sftp-server \
+  network-manager netplan.io wpasupplicant wireless-regdb \
+  iw rfkill iproute2 iputils-ping wget \
+  systemd systemd-sysv systemd-timesyncd udev dbus \
+  kmod e2fsprogs util-linux mount \
+  login passwd adduser sudo bash busybox coreutils \
+  grep sed findutils tar gzip xz-utils \
+  tzdata locales python3 procps netbase
+
+然后就开始卸载，首先卸载第一批GNOME桌面及主要桌面应用，这一批包括图形登录界面、桌面、设置中心、文件管理器、图形终端和图形更新工具，删除图形更新工具后，SSH中的apt update、apt install仍然保留：
+sudo chroot ~/rk3588-task-d/rootfs apt-get \
+  --no-download --no-install-recommends \
+  -o Dir::State::lists=/nonexistent \
+  -o Dir::Cache::pkgcache= \
+  -o Dir::Cache::srcpkgcache= \
+  purge \
+  ubuntu-desktop ubuntu-desktop-minimal ubuntu-session \
+  gdm3 gnome-shell gnome-control-center \
+  nautilus gnome-terminal \
+  ubuntu-release-upgrader-gtk update-manager update-notifier
+
+然后卸载第二批，移除蓝牙服务、音频服务和音视频处理组件：
+sudo chroot ~/rk3588-task-d/rootfs apt-get \
+  --no-download --no-install-recommends \
+  -o Dir::State::lists=/nonexistent \
+  -o Dir::Cache::pkgcache= \
+  -o Dir::Cache::srcpkgcache= \
+  purge \
+  bluez \
+  pipewire pipewire-alsa pipewire-audio pipewire-bin pipewire-pulse \
+  wireplumber \
+  alsa-base alsa-utils linux-sound-base sound-theme-freedesktop \
+  gstreamer1.0-alsa gstreamer1.0-pipewire \
+  gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-extra \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-tools
+
+第三批清除一下神奇的支持包：
+sudo chroot ~/rk3588-task-d/rootfs apt-get \
+  --no-download --no-install-recommends \
+  -o Dir::State::lists=/nonexistent \
+  -o Dir::Cache::pkgcache= \
+  -o Dir::Cache::srcpkgcache= \
+  purge \
+  modemmanager network-manager-pptp pptp-linux ppp \
+  usb-modeswitch usb-modeswitch-data \
+  ghostscript openprinting-ppds foomatic-db-compressed-ppds \
+  printer-driver-pnm2ppa libsane1 libsane-common \
+  colord colord-data geoclue-2.0 spice-vdagent
+
+卸载后我们现在可以清理不再需要的自动安装依赖：
+sudo chroot ~/rk3588-task-d/rootfs apt-get \
+  --no-download --no-install-recommends \
+  -o Dir::State::lists=/nonexistent \
+  -o Dir::Cache::pkgcache= \
+  -o Dir::Cache::srcpkgcache= \
+  autoremove --purge
+
+下一批处理残留的图形组件、字体、图标和完整版 Vim，同时清理它们不再需要的依赖：
+sudo chroot ~/rk3588-task-d/rootfs apt-get \
+  --no-download --no-install-recommends \
+  -o Dir::State::lists=/nonexistent \
+  -o Dir::Cache::pkgcache= \
+  -o Dir::Cache::srcpkgcache= \
+  --autoremove purge \
+  adwaita-icon-theme hicolor-icon-theme \
+  fonts-dejavu-core fonts-dejavu-mono \
+  fonts-noto-cjk fonts-noto-mono \
+  fonts-urw-base35 fonts-wqy-zenhei \
+  xfonts-encodings xfonts-utils \
+  gcr gcr4 gnome-keyring gnome-keyring-pkcs11 pinentry-gnome3 \
+  glycin-loaders glycin-thumbnailers \
+  gvfs gvfs-backends gvfs-common gvfs-daemons gvfs-libs \
+  udisks2 xauth \
+  gstreamer1.0-plugins-base v4l-utils \
+  vim vim-common vim-runtime
+
+因为我们最初的目标就是后面使用什么都自己下载什么都不留，只要最简单，所以再删除镜像里的Chromium文件：
+sudo chroot ~/rk3588-task-d/rootfs /bin/rm -rf -- \
+  /usr/lib/chromium-browser \
+  /usr/bin/chromium-browser \
+  /usr/share/applications/chromium-browser.desktop \
+  /usr/share/chromium-browser \
+  /etc/chromium-browser \
+  /opt/chromium-rkmpp-codec-filter
+然后清理apt缓存：
+sudo chroot ~/rk3588-task-d/rootfs apt-get clean &&
+sudo chroot ~/rk3588-task-d/rootfs /bin/rm -f -- \
+  /var/cache/apt/pkgcache.bin \
+  /var/cache/apt/srcpkgcache.bin
+
+然后就可以查看现在的镜像大小的占用：
+zzy@LAPTOP-4S39SRHC:/mnt/c/Users/youyou$ df -h ~/rk3588-task-d/rootfs
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/loop0      3.1G  680M  2.3G  23% /home/zzy/rk3588-task-d/rootfs
+（发现确实是缩小了，但是镜像还没有变小，所以还要压缩）
+
+然后配置一下启动方式到命令行：
+sudo systemctl --root="$HOME/rk3588-task-d/rootfs" \
+  set-default multi-user.target &&
+sudo systemctl --root="$HOME/rk3588-task-d/rootfs" \
+  enable NetworkManager.service ssh.socket serial-getty@ttyFIQ0.service
+（就是开机进入命令行，而不是原来的图形化桌面）
+
+然后处理一下DNS：
+printf '[main]\ndns=default\nrc-manager=file\n' \
+  | sudo tee ~/rk3588-task-d/rootfs/etc/NetworkManager/conf.d/90-minimal-dns.conf
+（配置让联网后可以访问软件源）
+
+关闭不需要的开机服务：
+sudo systemctl --root="$HOME/rk3588-task-d/rootfs" disable \
+  bluetooth-rfkill-unblock.service \
+  rkaiq_3A.service \
+  usb-gadget.service
+
+删除两个无效的启动链接：
+sudo chroot ~/rk3588-task-d/rootfs /bin/rm -f -- \
+  /etc/systemd/system/display-manager.service \
+  /etc/systemd/system/multi-user.target.wants/bt_8852bs.service
+
+修改权限服务描述文件不需要执行权限，也不应允许所有用户修改：
+sudo chmod 644 \
+  ~/rk3588-task-d/rootfs/usr/lib/systemd/system/bluetooth-rfkill-unblock.service \
+  ~/rk3588-task-d/rootfs/usr/lib/systemd/system/rkaiq_3A.service
+
+前面设置的拒绝服务操作删除，删包工作已完成，不能把“拒绝服务操作”的临时策略带到最终系统中：
+sudo chroot ~/rk3588-task-d/rootfs /bin/rm -f -- \
+  /usr/sbin/policy-rc.d
+
+保存修改，卸载镜像：
+sync &&
+sudo umount -R ~/rk3588-task-d/rootfs/dev &&
+sudo umount ~/rk3588-task-d/rootfs/proc &&
+sudo umount ~/rk3588-task-d/rootfs/sys &&
+sudo umount ~/rk3588-task-d/rootfs
+
+检查文件结构一致：
+sudo e2fsck -f ~/rk3588-task-d/images/ubuntu-rootfs-work.img
+输出：
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+
+Pass 3: Checking directory connectivity
+Pass 3A: Optimizing directories
+Inode 18468 extent tree (at level 1) could be shorter.  Optimize<y>? yes
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+
+/home/zzy/rk3588-task-d/images/ubuntu-rootfs-work.img: ***** FILE SYSTEM WAS MODIFIED *****
+/home/zzy/rk3588-task-d/images/ubuntu-rootfs-work.img: 22767/210912 files (0.1% non-contiguous), 206354/842752 blocks
+
+现在包变小了，但是镜像并没有直接变小，所以还要我们来手动压缩镜像包的体积，先先调整 ext4 内部布局，再把镜像文件长度设为对应大小，不能直接截短原来的镜像文件：
+sudo resize2fs \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img 1280M &&
+sudo truncate -s 1280M \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img &&
+sudo e2fsck -f \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img
+
+然后就可以发现镜像已经变小了：
+zzy@LAPTOP-4S39SRHC:/mnt/c/Users/youyou$ ls -lh ~/rk3588-task-d/images/ubuntu-rootfs-work.img
+-rwxr-xr-x 1 zzy zzy 1.3G Oct 31 11:33 /home/zzy/rk3588-task-d/images/ubuntu-rootfs-work.img
+
+/*
+镜像就是相当于一个系统盘的克隆，烧录只是把这个系统盘给复制上去了，并不是像安装包一样的安装上去的，它可以从现有分区复制出来，也可以先创建一个空的 ext4 镜像，再把准备好的系统文件放进去，这也解释了为什么删软件后，镜像文件没有马上缩小。
+所以根文件系统镜像保存的是已经准备好的文件系统及其结构；烧录是把它部署到存储分区。软件安装主要发生在镜像制作阶段，首次启动可能再完成少量初始化。
+*/
+
+到现在就是裁剪完成了，现在导出roofs出来：
+cp --update=none --sparse=always \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img \
+  "/mnt/d/linux/sdk编译包/分体包/ubuntu26-minimal-rootfs.img" &&
+cmp \
+  ~/rk3588-task-d/images/ubuntu-rootfs-work.img \
+  "/mnt/d/linux/sdk编译包/分体包/ubuntu26-minimal-rootfs.img" &&
+echo "精简 rootfs 导出并校验通过"
+
+打包后就看到了"D:\linux\sdk编译包\分体包\ubuntu26-minimal-rootfs.img"
+现在打包成updata.img，但是需要借助SDK里面的打包工具，所以先挂载我们的SDK虚拟盘：wsl --mount --vhd "H:\wsl\rk3588-ext4.vhdx" --bare
+先准备打包目录：
+task_src="/mnt/d/linux/sdk编译包/分体包"
+task_pack="$HOME/rk3588-task-d/pack"
+task_tools="/mnt/rk3588/atk_dlrk3588_linux6.12/tools/linux/Linux_Pack_Firmware/rockdev"
+
+mkdir -p "$task_pack/Image" "$task_pack/tools" &&
+cp --update=none \
+  "$task_tools/afptool" "$task_tools/rkImageMaker" \
+  "$task_pack/tools/" &&
+cp --update=none \
+  "$task_src"/{MiniLoaderAll.bin,uboot.img,boot.img,recovery.img,misc.img,oem.img,userdata.img,parameter.txt} \
+  "$task_pack/Image/" &&
+cp --update=none \
+  "$task_src/ubuntu26-minimal-rootfs.img" \
+  "$task_pack/Image/rootfs.img"
+
+创建打包清单：
+cat > "$task_pack/Image/package-file" <<'EOF'
+# NAME PATH
+package-file package-file
+parameter parameter.txt
+bootloader MiniLoaderAll.bin
+uboot uboot.img
+misc misc.img
+boot boot.img
+recovery recovery.img
+backup RESERVED
+oem oem.img
+userdata userdata.img
+rootfs rootfs.img
+EOF
+
+执行打包：
+cd ~/rk3588-task-d/pack &&
+./tools/afptool -pack ./Image update.raw.img &&
+./tools/rkImageMaker -RK3588 \
+  ./Image/MiniLoaderAll.bin \
+  update.raw.img \
+  atk_dlrk3588_ubuntu26_minimal_update.img \
+  -os_type:androidos
+输出：
+Make firmware OK!
+------ OK ------
+********rkImageMaker ver 2.29********
+Generating new image, please wait...
+Writing head info...
+Writing boot file...
+Writing firmware...
+Generating MD5 data...
+MD5 data generated successfully!
+New image generated successfully!
+
+打包成功，复制输出得到："D:\linux\sdk编译包\atk_dlrk3588_ubuntu26_minimal_update.img"，任务完成
+现在上版验证，成功连接串口，配置wifi，成功使用ssh，裁剪完成
