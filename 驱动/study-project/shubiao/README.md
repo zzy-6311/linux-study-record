@@ -2,11 +2,34 @@
 
 整理日期：2026-11-06。
 
-**新增内核转发版本（当前尚未上板验证）**：`c驱动/bridge/` 和 `python/driver_control.py`。
+**当前使用：内核转发版本，纯透传和 200ms 位移注入均已上板验证。**
+源码位于 `c驱动/bridge/`，控制程序为 `python/driver_control.py`。
 这个版本把输入采集、HID 报告编码和 USB 输出全部放在内核中，Python 仅发控制 ioctl。
 已通过本机 Linux 6.12.69 源码的目标文件编译检查（W=1）及核心逻辑测试。
-尚缺官方 SDK 匹配环境的正式模块构建，以及真实 USB 枚举、透传和注入验收。
+现已通过官方 SDK 正式构建，模块版本 0.3，vermagic 为 `6.12.69 SMP mod_unload aarch64`。
+板上模块加载成功，Windows 识别为 `HID-compliant mouse`，序列号 `ZZY-KERNEL-MOUSE-001`。
+用户已确认纯内核鼠标控制正常，并看到第二轮定时注入按节奏移动、在约五秒后停止。
 以下原 Python 版本仍作为已验证的回退版本保留。两种转发方式不能同时运行。
+
+### 2026-11-06 上板验收结果
+
+| 项目 | 结果 |
+|---|---|
+| SDK 正式构建 | W=1，无编译警告，模块 0.3 |
+| Windows 识别 | USB 输入设备和 HID-compliant mouse 均为 OK |
+| 纯驱动透传 | 用户确认可控制；首次误以为异常是物理鼠标休眠 |
+| 物理输入计数 | 10733 条事件；当时已完成 3889 个 USB 报告（含初始化释放报告） |
+| 物理位移核对 | X=1172、Y=-423，输入和 USB 完成总量一致 |
+| 定时注入 | 两轮，每轮 25 次，每次 X=+4、Y=0，目标间隔 200ms |
+| 注入总量核对 | 每轮 injected 增加 25，USB completed 增加 25，完成位移 X 增加 100 |
+| 第二轮视觉确认 | 用户确认光标按节奏移动，随后停止 |
+| 错误及丢弃 | 两轮均无新增 usb_errors 和 dropped |
+| 注入结束后 | Python 退出；enabled=1，纯内核透传继续 |
+
+这验证的是当前鼠标、当前板子及当前 Windows 主机上的两种功能。
+没有据此宣称低于原 Python 方案的延迟，也没有完成热插拔、长时间压力、所有 HID 兼容性或开机自动运行验收。
+
+正式模块 SHA-256：`686bea41987dce4b08c76d5d91c75384af54c18bc2c8d68bf9b1d20ab37de771`。
 
 ## 新版本：两种测试
 
@@ -16,6 +39,7 @@
 c驱动/bridge/Makefile
 c驱动/bridge/zzy_mouse_bridge.c
 c驱动/bridge/zzy_bridge_uapi.h
+c驱动/bridge/zzy_mouse_bridge.ko
 python/driver_control.py
 ```
 
@@ -69,6 +93,8 @@ python3 driver_control.py status
 
 应看到 `enabled=1`、`completed` 增加，且无新增 `usb_errors` 或异常丢弃。
 `completed` 表示 USB 请求已完成，不能据此声称电脑应用或屏幕已显示动作。
+`queued` 只统计尚未提交的报告，不包含正在 USB 上传输的一份报告；
+刚提交最后一次注入时，submitted 比 completed 多 1 可能是正常瞬时状态，静止等待后再核对。
 
 ### 测试二：每 200ms 注入固定偏移
 
@@ -113,7 +139,11 @@ sh /etc/init.d/S50usb-gadget.sh start
 
 目标：2.4G 鼠标接收器插入 RK3588 的 USB Host，由板子读取鼠标动作，再通过 USB OTG 模拟鼠标发送给电脑。
 
-## 当前完成到哪里
+## 以下为原 Python 转发与第二阶段采集驱动的回退说明
+
+上面新版本已经实现内核接收和发送。以下旧版本不参与本次内核转发测试，保留供对照和回退。
+
+### 旧版本完成到哪里
 
 - **Python 转发已经上板验证**：读取 Linux 输入事件，转成 USB HID 报告，电脑能被鼠标控制。
 - **自编 C 驱动完成输入采集**：通过 input_handler 接收鼠标事件，通过 `/dev/zzy_mouse` 提供 read、poll 和 ioctl。ABI 版本为 2。
@@ -224,7 +254,7 @@ make -C /mnt/rk3588/atk_dlrk3588_linux6.12/kernel \
 
 USB HID 模块同理：把 `usb_hid` 中的源码和 Makefile 放到独立的 `/mnt/rk3588/mouse-hid-module`，将上述 `M=` 改为该目录。不要把两个 Makefile 混在一起。不要直接在包含空格的 Windows 归档路径下进行 Kbuild 编译。
 
-## 下一步
+## 旧版本当时的后续计划（已被上文内核转发方案替代）
 
 1. 增加 Python 驱动转发入口，用 `/dev/zzy_mouse` 替代原始 evdev，复用现有 HID 报告编码与输出逻辑。
 2. 处理 ABI 校验、连接状态、队列溢出、停止时释放按键以及 USB 输出超时。
@@ -232,3 +262,8 @@ USB HID 模块同理：把 `usb_hid` 中的源码和 Makefile 放到独立的 `/
 4. 再讨论把哪些处理移进内核，以及绝对坐标、AI 指令接口和开机启动。用相同方法测量延迟后再判断收益，不能假定改用驱动一定更快。
 
 原 PyCharm 工程和板上程序在此次归档中均未删除、未替换。本目录是本次指定的精简代码归档。
+
+后续新增的内核转发模块和控制程序已上传到板子 `/root/linux-shubiao/`。
+它们以独立文件部署，没有覆盖旧的 `mouse_bridge.py`；运行时已停止官方 ADB gadget，
+由新模块占用 OTG 控制器。电脑上的权威源码是本目录 `c驱动/bridge` 与 `python/driver_control.py`，
+原 PyCharm 路径不会自动同步这些新增文件。
