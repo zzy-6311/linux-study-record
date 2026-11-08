@@ -32,6 +32,11 @@ static bool configured, enabled, busy, connected, dirty, bound;
 static u8 buttons;
 static s32 axes[4];
 static struct work_struct tx_work;
+static struct delayed_work click_release_work;
+static struct file *ai_owner;
+static bool ai_active;
+static u8 ai_buttons;
+static u32 ai_generation, ai_commands, ai_clicks;
 static char *udc_name = "fc000000.usb";
 module_param(udc_name, charp, 0444);
 MODULE_PARM_DESC(udc_name, "USB device controller to bind (never USB Host)");
@@ -85,6 +90,10 @@ static void halt_locked(int error, bool neutral)
 {
     struct mouse_report release = {};
     enabled = false;
+    ai_active = false;
+    ai_buttons = 0;
+    ai_generation++;
+    cancel_delayed_work(&click_release_work);
     counters.last_error = error;
     counters.dropped += kfifo_len(&queue);
     kfifo_reset(&queue);
@@ -111,7 +120,8 @@ static bool emit_locked(s32 dx, s32 dy, s32 wheel, s32 pan)
         s32 x = clamp(dx, -32767, 32767), y = clamp(dy, -32767, 32767);
         s32 w = clamp(wheel, -127, 127), p = clamp(pan, -127, 127);
         struct mouse_report r = {
-            .buttons = buttons, .x = cpu_to_le16((u16)x),
+            .buttons = (buttons & ~(ai_owner ? BIT(3) : 0)) | ai_buttons,
+            .x = cpu_to_le16((u16)x),
             .y = cpu_to_le16((u16)y), .wheel = w, .pan = p,
         };
         if (!enqueue_locked(&r))
@@ -125,6 +135,31 @@ static void flush_locked(void)
     if (dirty && enabled && configured)
         emit_locked(axes[0], axes[1], axes[2], axes[3]);
     reset_motion_locked();
+}
+
+static void cancel_ai_locked(void)
+{
+    ai_active = false;
+    ai_buttons = 0;
+    ai_generation++;
+    cancel_delayed_work(&click_release_work);
+    counters.dropped += kfifo_len(&queue);
+    kfifo_reset(&queue);
+    reset_motion_locked();
+    if (enabled && configured)
+        emit_locked(0, 0, 0, 0);
+}
+
+static void release_click(struct work_struct *work)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&lock, flags);
+    if (ai_buttons) {
+        ai_buttons = 0;
+        if (enabled && configured)
+            emit_locked(0, 0, 0, 0);
+    }
+    spin_unlock_irqrestore(&lock, flags);
 }
 
 static void tx_complete(struct usb_ep *ep, struct usb_request *req)
@@ -189,6 +224,19 @@ static void receive_event(struct input_handle *handle, unsigned int type,
         if (next != buttons) {
             flush_locked();
             buttons = next;
+            if (ai_owner && code == BTN_SIDE) {
+                if (value) {
+                    if (ai_active)
+                        cancel_ai_locked();
+                    else if (enabled && configured && !(buttons & ~BIT(3))) {
+                        ai_active = true;
+                        ai_generation++;
+                    }
+                }
+                goto out_event; /* reserved switch never reaches the PC */
+            }
+            if (ai_owner)
+                ai_generation++; /* physical button invalidates old inference */
             if (enabled && configured)
                 emit_locked(0, 0, 0, 0);
         }
@@ -198,6 +246,8 @@ static void receive_event(struct input_handle *handle, unsigned int type,
         if (type == EV_SYN && code == SYN_REPORT)
             flush_locked();
         if (type == EV_REL) {
+            if (ai_owner && value && (code == REL_X || code == REL_Y))
+                ai_generation++;
             switch (code) {
             case REL_X: axis = 0; counters.physical_x += value; break;
             case REL_Y: axis = 1; counters.physical_y += value; break;
@@ -213,6 +263,7 @@ static void receive_event(struct input_handle *handle, unsigned int type,
             }
         }
     }
+out_event:
     spin_unlock_irqrestore(&lock, flags);
 }
 static int connect_mouse(struct input_handler *handler, struct input_dev *dev,
@@ -285,10 +336,96 @@ static long control_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     void __user *user = (void __user *)arg;
     struct zzy_bridge_stats stats;
     struct zzy_bridge_delta delta;
+    struct zzy_ai_state ai_state;
+    struct zzy_ai_report ai_report;
     unsigned long flags;
     u32 value;
     int ret = 0;
     switch (cmd) {
+    case ZZY_AI_SESSION:
+        if (copy_from_user(&value, user, sizeof(value)))
+            return -EFAULT;
+        if (value > 1)
+            return -EINVAL;
+        spin_lock_irqsave(&lock, flags);
+        if (ai_owner && ai_owner != file) {
+            ret = -EBUSY;
+        } else if (value) {
+            if (!connected || !configured || !enabled)
+                ret = -ENODEV;
+            else if (buttons)
+                ret = -EBUSY;
+            else {
+                ai_owner = file;
+                cancel_ai_locked();
+            }
+        } else if (ai_owner == file) {
+            cancel_ai_locked();
+            ai_owner = NULL;
+            if (enabled && configured)
+                emit_locked(0, 0, 0, 0);
+        }
+        spin_unlock_irqrestore(&lock, flags);
+        return ret;
+    case ZZY_AI_STATE:
+        spin_lock_irqsave(&lock, flags);
+        ai_state = (struct zzy_ai_state) {
+            .abi = 1, .size = sizeof(ai_state), .active = ai_active,
+            .generation = ai_generation, .synthetic_buttons = ai_buttons,
+            .side_code = BTN_SIDE, .commands = ai_commands, .clicks = ai_clicks,
+        };
+        spin_unlock_irqrestore(&lock, flags);
+        return copy_to_user(user, &ai_state, sizeof(ai_state)) ? -EFAULT : 0;
+    case ZZY_AI_CANCEL:
+        spin_lock_irqsave(&lock, flags);
+        if (ai_owner != file)
+            ret = -EPERM;
+        else
+            cancel_ai_locked();
+        spin_unlock_irqrestore(&lock, flags);
+        return ret;
+    case ZZY_AI_REPORT:
+        if (copy_from_user(&ai_report, user, sizeof(ai_report)))
+            return -EFAULT;
+        if (ai_report.buttons > 1 || ai_report.dx < -2000 || ai_report.dx > 2000 ||
+            ai_report.dy < -2000 || ai_report.dy > 2000)
+            return -ERANGE;
+        spin_lock_irqsave(&lock, flags);
+        if (ai_owner != file) {
+            ret = -EPERM;
+        } else if (!ai_report.buttons && !ai_report.dx && !ai_report.dy) {
+            ai_buttons = 0; /* release is allowed even after OFF or epoch change */
+            cancel_delayed_work(&click_release_work);
+            if (enabled && configured)
+                emit_locked(0, 0, 0, 0);
+        } else if (!ai_active || !connected || !configured || !enabled) {
+            ret = -EACCES;
+        } else if (ai_report.generation != ai_generation) {
+            ret = -ESTALE;
+        } else if (buttons & ~BIT(3)) {
+            ret = -EBUSY;
+        } else {
+            u8 previous = ai_buttons;
+            flush_locked();
+            ai_buttons = ai_report.buttons;
+            if (!enabled || !emit_locked(ai_report.dx, ai_report.dy, 0, 0)) {
+                ai_buttons = 0;
+                ret = -ENOSPC;
+            } else {
+                counters.injected++;
+                counters.injected_x += ai_report.dx;
+                counters.injected_y += ai_report.dy;
+                ai_commands++;
+                if (ai_buttons && !previous)
+                    ai_clicks++;
+                if (ai_buttons)
+                    mod_delayed_work(system_wq, &click_release_work, msecs_to_jiffies(120));
+                else
+                    cancel_delayed_work(&click_release_work);
+            }
+        }
+        spin_unlock_irqrestore(&lock, flags);
+        return ret;
     case ZZY_BRIDGE_STATUS:
         spin_lock_irqsave(&lock, flags);
         stats = counters;
@@ -327,7 +464,9 @@ static long control_ioctl(struct file *file, unsigned int cmd, unsigned long arg
             delta.dy < -32767 || delta.dy > 32767)
             return -ERANGE;
         spin_lock_irqsave(&lock, flags);
-        if (!connected || !configured || !enabled) {
+        if (ai_owner) {
+            ret = -EBUSY;
+        } else if (!connected || !configured || !enabled) {
             ret = -ENODEV;
         } else {
             flush_locked();
@@ -345,8 +484,22 @@ static long control_ioctl(struct file *file, unsigned int cmd, unsigned long arg
         return -ENOTTY;
     }
 }
+static int control_release(struct inode *inode, struct file *file)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&lock, flags);
+    if (ai_owner == file) {
+        cancel_ai_locked();
+        ai_owner = NULL;
+        if (enabled && configured)
+            emit_locked(0, 0, 0, 0);
+    }
+    spin_unlock_irqrestore(&lock, flags);
+    return 0;
+}
 static const struct file_operations control_fops = {
     .owner = THIS_MODULE, .unlocked_ioctl = control_ioctl,
+    .release = control_release,
 #ifdef CONFIG_COMPAT
     .compat_ioctl = compat_ptr_ioctl,
 #endif
@@ -415,7 +568,7 @@ static int function_setup(struct usb_function *f, const struct usb_ctrlrequest *
         if (value != (1 << 8)) /* input report, no report ID */
             return -EOPNOTSUPP;
         spin_lock_irqsave(&lock, flags);
-        r.buttons = enabled ? buttons : 0;
+        r.buttons = enabled ? (buttons & ~(ai_owner ? BIT(3) : 0)) | ai_buttons : 0;
         spin_unlock_irqrestore(&lock, flags);
         data = &r; size = sizeof(r);
         break;
@@ -532,6 +685,7 @@ static int __init bridge_init(void)
     BUILD_BUG_ON(sizeof(struct zzy_bridge_stats) != 128);
     INIT_KFIFO(queue);
     INIT_WORK(&tx_work, transmit);
+    INIT_DELAYED_WORK(&click_release_work, release_click);
     ret = usb_composite_probe(&composite);
     if (ret)
         return ret;
@@ -551,6 +705,7 @@ static int __init bridge_init(void)
     return 0;
 unregister_usb:
     usb_composite_unregister(&composite);
+    cancel_delayed_work_sync(&click_release_work);
     cancel_work_sync(&tx_work);
     return ret;
 }
@@ -559,6 +714,7 @@ static void __exit bridge_exit(void)
     misc_deregister(&control);
     input_unregister_handler(&handler);
     usb_composite_unregister(&composite);
+    cancel_delayed_work_sync(&click_release_work);
     cancel_work_sync(&tx_work);
 }
 module_init(bridge_init);
@@ -566,4 +722,4 @@ module_exit(bridge_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ZZY");
 MODULE_DESCRIPTION("In-kernel USB mouse bridge with relative injection control");
-MODULE_VERSION("0.3");
+MODULE_VERSION("0.4");

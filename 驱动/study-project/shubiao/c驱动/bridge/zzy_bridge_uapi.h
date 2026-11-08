@@ -14,4 +14,19 @@ struct zzy_bridge_delta { __s32 dx, dy; };
 #define ZZY_BRIDGE_STATUS _IOR('M', 0, struct zzy_bridge_stats)
 #define ZZY_BRIDGE_ENABLE _IOW('M', 1, __u32)
 #define ZZY_BRIDGE_INJECT _IOW('M', 2, struct zzy_bridge_delta)
+/* AI is a single file-owned session. BTN_SIDE toggles it, initially OFF.
+ * Generation prevents an inference started before OFF/ON or manual motion
+ * from submitting an old command. Closing the file releases synthetic keys.
+ */
+struct zzy_ai_state {
+    __u32 abi, size, active, generation, synthetic_buttons, side_code, commands, clicks;
+};
+struct zzy_ai_report {
+    __u32 generation, buttons; /* only bit 0 (left) is accepted */
+    __s32 dx, dy;
+};
+#define ZZY_AI_SESSION _IOW('M', 3, __u32)
+#define ZZY_AI_STATE _IOR('M', 4, struct zzy_ai_state)
+#define ZZY_AI_REPORT _IOW('M', 5, struct zzy_ai_report)
+#define ZZY_AI_CANCEL _IO('M', 6)
 #endif
